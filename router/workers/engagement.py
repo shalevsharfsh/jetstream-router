@@ -1,10 +1,11 @@
 """Engagement path — rolling like/repost counts, alerting on unusual traction.
 
-This is the highest-volume path by a wide margin. Sampling the live firehose,
-likes alone were ~70% of all events (~4,200 of 5,962 over 20 seconds) while
-follows were ~3.6%. A design that gave every path the same capacity would be
-simultaneously wasteful on the graph path and starved on this one, which is the
-concrete reason the paths scale independently rather than sharing a pool.
+This is the highest-volume path by a wide margin. Measured over 440,108
+classified events: engagement 79.3% of routed traffic, against 5.6% for the
+graph path — a 14.2x spread. A design that gave every path the same capacity
+would be simultaneously wasteful on the graph path and starved on this one,
+which is the concrete reason the paths scale independently rather than sharing
+a pool.
 
 Counting happens per *target* post, not per actor: the question is "is this post
 getting unusual traction", so likes and reposts of the same URI accumulate

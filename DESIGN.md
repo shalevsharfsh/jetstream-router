@@ -1,5 +1,10 @@
 # Design
 
+> A formatted version of this document — with architecture diagrams, the traffic
+> breakdown and the delivery plan as a timeline — is published at
+> **https://claude.ai/code/artifact/eb72e909-c456-4898-8975-5f01ce4e972c**
+> Same content, same section numbers; this file is the canonical copy.
+
 ## The problem, restated
 
 One high-volume stream carrying many kinds of events; work out what each event
@@ -7,13 +12,95 @@ is; route it to the right downstream work; make those paths run, fail and scale
 independently.
 
 The last clause is the whole exercise. Classifying a JSON object is not hard.
-Making four workers genuinely not interfere with each other is where the design
-decisions are, so that is what I optimised for and what the rest of this
+Making several workers genuinely not interfere with each other is where the
+design decisions are, so that is what I optimised for and what the rest of this
 document is about.
+
+**Section map** — §1 problem · §2 requirements · §3 measured traffic ·
+§4 high-level design · §5 options and tradeoffs · §6 key decisions ·
+§7 failure modes · §8 delivery plan · §9 risks and known gaps · §10 code map.
 
 ---
 
-## 1. The central decision: where the fan-out boundary goes
+## 1. Problem
+
+See above. The source is the Bluesky Jetstream firehose: a public,
+unauthenticated WebSocket carrying posts, likes, reposts, follows, blocks,
+profile and account changes, all interleaved on one connection.
+
+---
+
+## 2. Requirements
+
+**Functional.** Hold one durable connection and survive disconnects without
+losing position. Classify every event by `kind`, `collection` and `operation`.
+Dispatch to at least four behaviourally distinct paths — content matching,
+engagement aggregation, graph burst detection, and a separate retraction path.
+Never silently discard an unrecognised event type.
+
+**Non-functional — the ones that shaped the design.**
+
+| Requirement | Target | How it is met |
+|---|---|---|
+| Path isolation | One path failing affects no other | Separate process, consumer, retry budget and DLQ per path |
+| Bounded memory | No unbounded growth under overload | Fixed-size ingest queue with explicit shed policy; TTL'd window buckets |
+| Independent scaling | Per-path capacity | KEDA on consumer lag, per path, non-uniform policies |
+| Observability | Answer "are we keeping up?" directly | `cursor_lag_seconds`, gating readiness |
+| Resumability | No gap across a restart | `time_us` cursor, checkpointed, rewound on resume |
+| Local reproducibility | One command, no cloud account | `make deploy` onto kind |
+
+**Explicit non-goals.** No UI, no auth, no multi-tenancy, no exactly-once, no
+multi-region. Excluded so the paths that exist are complete rather than numerous.
+
+---
+
+## 3. Traffic, measured
+
+I sampled the live firehose before writing the classifier rather than coding
+from the docs. Three findings changed the design:
+
+1. **Deletes carry no `record`** — only `collection` and `rkey`. So referential
+   cleanup is *impossible* without an index the create path writes
+   (`(did, collection, rkey) -> subject_uri`). At firehose volume that is a
+   write per engagement event, purely to make deletes resolvable. Whether that
+   is worth paying depends on whether counts must be exact; for a signal, no. So
+   the retraction path records the retraction (which is genuinely useful — "was
+   this deleted?" is what compliance needs) and exposes the gap as
+   `jsr_retractions_total{resolution="no-index"}` rather than pretending the
+   cleanup happened.
+2. **The volume skew is large and stable.** Measured over 440,108 classified
+   events on this cluster: engagement 79.3%, content 12.1%, graph 5.6%,
+   retraction 2.9%, other 0.2% — a **14.2× spread** between the busiest and
+   quietest real path. That is the empirical case for per-path scaling; a
+   uniform worker pool would be simultaneously starved and wasteful.
+
+   (A note on measuring this honestly: my first figure was 106×, taken from
+   per-worker *handled* counters. It was wrong — the graph worker had been
+   scaled to zero for part of that window, so I had measured worker uptime, not
+   stream composition. The classifier's counters see every event regardless of
+   worker state, which is why they are the right source. Worth knowing which of
+   your metrics answers the question you are actually asking.)
+3. **Naive keyword matching is unusable.** With `ai` in the keyword list,
+   `"ai" in text` fires on *said*, *again*, *email*, *Dubai*. Against live data
+   that was nearly every match. The fix is a word boundary — but expressed as
+   `(?<!\w)…(?!\w)`, not `\b`: `\b` is a *transition*, so `\bc\+\+\b` matches
+   nothing at all, since the character after `+` would have to be a word
+   character. My own test for `c++` caught that. A notification path that cries
+   wolf is worse than no notification path.
+
+**On content handling.** This is a public, unfiltered firehose. Post text is
+matched against, never emitted: alerts carry the DID, record key and which
+keyword hit, plus text length — not the text. Logs are the easiest place to
+accidentally build a permanent, widely-readable copy of exactly the content you
+were told to be careful with. Similarly, `collection` is user-extensible in the
+AT Protocol, so it is bounded to a known set before being used as a metric
+label — otherwise a stranger can mint unbounded Prometheus series from the
+public internet and take out your monitoring during the incident you needed it
+for.
+
+---
+
+## 4. High-level design — and the central decision
 
 The obvious implementation is one process: a goroutine (or task) per handler, a
 channel per event type, a `select` in the middle. It is less code, it has no
@@ -44,7 +131,7 @@ requirement had been "lowest possible latency for one kind of event", it would
 not have been.
 
 **Verification, not assertion.** `make chaos` deletes the busiest worker. With
-engagement (~70% of traffic) down for ~30 seconds, content processed 1,067 more
+engagement (~79% of traffic) down for ~30 seconds, content processed 1,067 more
 events and retraction 258, uninterrupted; engagement's consumer drained back to
 zero pending on restart. That is the property, demonstrated rather than claimed.
 
@@ -79,71 +166,8 @@ that on directly rather than pretend the choice was free.
 
 ---
 
-## 2. Ingest: the one thing that cannot be elastic
-
-Everything downstream of the tap is stateless and disposable. The tap is not,
-and finding that boundary is the interesting part of the design.
-
-A long-lived WebSocket holding a resume cursor has no home in a function
-execution model — there is no 15-minute-bounded, connection-affinity-free way to
-own a socket. So: exactly one always-on process, and everything after it
-elastic. On AWS that is a single Fargate task, not a Lambda, and
-`infra/cdk/app.py` says so explicitly. Any design that claims to be
-"fully serverless" here is either wrong or hiding the tap.
-
-`replicas: 1` is therefore a **correctness** constraint. Two taps would each
-hold a socket, receive the same events and publish everything twice, silently
-doubling every aggregate in the system. The Deployment uses `strategy: Recreate`
-for the same reason — a rolling update would briefly run two.
-
-### Backpressure is a policy, not an emergent behaviour
-
-Reader and publisher are decoupled by a bounded queue. When the broker is slower
-than the firehose, something must give, and I made the choice explicit and
-configurable rather than accidental:
-
-- **`shed`** — drop the oldest queued event, keep reading. Latency stays
-  bounded; completeness does not. Every drop increments
-  `jsr_events_shed_total`, labelled by destination. Never silent.
-- **`block`** — stop reading the socket. TCP backpressure propagates upstream,
-  nothing is lost, but we fall behind and may be disconnected — at which point
-  the cursor brings us back without a gap.
-
-Neither is universally right. `shed` suits statistical paths (a traction
-estimate does not need every like); `block` suits paths where a missing event is
-a correctness bug. The current default is `shed` because three of the four paths
-are aggregate. That this is one global setting rather than per-destination is a
-real limitation — see §7.
-
-The cheapest backpressure is not receiving the event at all, so
-`wantedCollections` is derived *from the routing table* rather than configured
-alongside it. The filter cannot drift out of sync with what we can actually
-route, and we never pay bandwidth or parse cost for events we would discard.
-
-### Cursor
-
-The cursor advances on the `time_us` of the last **published** event, not the
-last read one — advancing on read would let a crash between read and publish
-punch a hole in the stream. It is checkpointed to Redis every 2s, and on resume
-we rewind 5 seconds. We deliberately reprocess a small window rather than risk a
-gap.
-
-Two known properties of Jetstream shape this: `time_us` is instance-local, so
-it is not a global identity, and there are no sequence numbers, so **a gap is
-undetectable** — you cannot tell whether you missed anything. That asymmetry is
-exactly why the resume is biased toward duplication.
-
-`jsr_tap_cursor_lag_seconds` — wall clock minus the last published event's
-timestamp — is the single most useful number in the service, and it gates
-readiness. A tap holding a healthy socket while ninety seconds behind is not
-working, and a readiness probe that only checked socket state would report it as
-fine. (Liveness and readiness are deliberately different: losing the upstream
-makes the tap un-ready but not dead, and restarting it would only throw away the
-reconnect backoff it has earned.)
-
 ---
-
-## 3. Routing
+### Routing
 
 `router/routing.py` is a pure function: event in, destination out, no I/O and no
 clock. That purity is deliberate — it is what makes the routing table
@@ -199,7 +223,143 @@ change at all.
 
 ---
 
-## 4. Isolation, concretely
+## 5. Options and tradeoffs
+
+Four architectures were genuinely on the table for the fan-out boundary. The
+decision is not "which is best" but "which property am I buying, and what am I
+paying for it".
+
+### A — Single process, tasks and channels *(rejected)*
+
+One binary; a task per handler, a channel per event type, a dispatcher between.
+
+- **For:** least code, lowest latency, nothing to operate, in-process state.
+- **Against:** isolation is a *convention* — one panic, one leak, one slow
+  handler and every path is affected. One scaling unit, one deploy blast radius.
+- **Why rejected:** it fails the one requirement the brief emphasises. Worth
+  saying plainly, though: in Go this option is considerably stronger than in
+  Python, and the gap between A and B narrows.
+
+### B — Broker at the fan-out boundary *(selected)*
+
+The tap classifies and publishes to a per-destination subject; each path is a
+separate deployment with its own durable consumer.
+
+- **For:** isolation is *structural*. Retry, DLQ and backpressure come from the
+  broker rather than being hand-rolled per handler. Per-path scaling and deploys.
+- **Against:** a broker to run, serialisation on both sides, one more hop, and
+  state must leave the process.
+- **Why selected:** it is the only option where "independent" survives someone
+  being careless.
+
+### C — One WebSocket per event type *(rejected)*
+
+Skip the broker; give each worker its own connection with its own
+`wantedCollections` filter. Jetstream supports this directly.
+
+- **For:** total isolation, no broker at all, each path scales its own ingest.
+  Genuinely tempting.
+- **Against:** N connections to a public service we do not own, with rate limits
+  that are theirs to change. N independent cursors and no shared view of the
+  stream. And deletes cannot be filtered server-side, so the retraction path
+  must receive everything regardless.
+- **Why rejected:** it pushes our fan-out problem onto someone else's
+  infrastructure, and it does not generalise — the moment the source is Kafka or
+  a paid API rather than a free public socket, the design collapses.
+
+### D — Stream processor, Flink or Spark Structured Streaming *(rejected for now)*
+
+Land the raw stream in Kafka; express routing and aggregation as a streaming job.
+
+- **For:** proper event-time windows, watermarks, managed state, checkpointing.
+  This is where the design ends up if the aggregations get genuinely complex.
+- **Against:** heavyweight for a 2–3 hour exercise, a cluster to operate, and
+  isolation is per-job — coarser than the per-path independence asked for.
+- **Why rejected for now:** the aggregations here are simple commutative
+  counters. This becomes the right answer when correlation *across* events —
+  "this sequence of individually legitimate actions is suspicious" — is the
+  requirement.
+
+### The decision in one table
+
+| Property | A single process | **B broker** | C N sockets | D stream processor |
+|---|---|---|---|---|
+| One path crashes | all die | **one consumer stops** | one path stops | job restarts |
+| One path is slow | shared channel backs up | **its lag grows only** | isolated | backpressure per operator |
+| Poison message | hand-rolled | **`max_deliver` + DLQ** | hand-rolled | side output |
+| Scaling unit | whole process | **per path** | per path | per operator |
+| Operational cost | lowest | **moderate** | low | highest |
+| Added latency | none | **one hop** | none | one hop + checkpoint |
+| Correlation across events | awkward | **awkward** | impossible | native |
+
+---
+
+## 6. Key decisions
+### D1–D3 · Ingest: the one thing that cannot be elastic
+
+Everything downstream of the tap is stateless and disposable. The tap is not,
+and finding that boundary is the interesting part of the design.
+
+A long-lived WebSocket holding a resume cursor has no home in a function
+execution model — there is no 15-minute-bounded, connection-affinity-free way to
+own a socket. So: exactly one always-on process, and everything after it
+elastic. On AWS that is a single Fargate task, not a Lambda, and
+`infra/cdk/app.py` says so explicitly. Any design that claims to be
+"fully serverless" here is either wrong or hiding the tap.
+
+`replicas: 1` is therefore a **correctness** constraint. Two taps would each
+hold a socket, receive the same events and publish everything twice, silently
+doubling every aggregate in the system. The Deployment uses `strategy: Recreate`
+for the same reason — a rolling update would briefly run two.
+
+### Backpressure is a policy, not an emergent behaviour
+
+Reader and publisher are decoupled by a bounded queue. When the broker is slower
+than the firehose, something must give, and I made the choice explicit and
+configurable rather than accidental:
+
+- **`shed`** — drop the oldest queued event, keep reading. Latency stays
+  bounded; completeness does not. Every drop increments
+  `jsr_events_shed_total`, labelled by destination. Never silent.
+- **`block`** — stop reading the socket. TCP backpressure propagates upstream,
+  nothing is lost, but we fall behind and may be disconnected — at which point
+  the cursor brings us back without a gap.
+
+Neither is universally right. `shed` suits statistical paths (a traction
+estimate does not need every like); `block` suits paths where a missing event is
+a correctness bug. The current default is `shed` because three of the four paths
+are aggregate. That this is one global setting rather than per-destination is a
+real limitation — see §9.
+
+The cheapest backpressure is not receiving the event at all, so
+`wantedCollections` is derived *from the routing table* rather than configured
+alongside it. The filter cannot drift out of sync with what we can actually
+route, and we never pay bandwidth or parse cost for events we would discard.
+
+### Cursor
+
+The cursor advances on the `time_us` of the last **published** event, not the
+last read one — advancing on read would let a crash between read and publish
+punch a hole in the stream. It is checkpointed to Redis every 2s, and on resume
+we rewind 5 seconds. We deliberately reprocess a small window rather than risk a
+gap.
+
+Two known properties of Jetstream shape this: `time_us` is instance-local, so
+it is not a global identity, and there are no sequence numbers, so **a gap is
+undetectable** — you cannot tell whether you missed anything. That asymmetry is
+exactly why the resume is biased toward duplication.
+
+`jsr_tap_cursor_lag_seconds` — wall clock minus the last published event's
+timestamp — is the single most useful number in the service, and it gates
+readiness. A tap holding a healthy socket while ninety seconds behind is not
+working, and a readiness probe that only checked socket state would report it as
+fine. (Liveness and readiness are deliberately different: losing the upstream
+makes the tap un-ready but not dead, and restarting it would only throw away the
+reconnect backoff it has earned.)
+
+---
+
+### D4–D6 · Isolation and scaling, concretely
 
 Each destination gets its own durable pull consumer with its own
 `filter_subject`, `max_deliver`, ack window and DLQ subject. Failure handling
@@ -227,7 +387,7 @@ DynamoDB.
 | Path | Policy | Why |
 |---|---|---|
 | content | fixed 1 | notification latency is user-visible; a cold start is felt |
-| engagement | KEDA 1→6 on lag | ~70% of traffic, bursty |
+| engagement | KEDA 1→6 on lag | ~79% of traffic, bursty |
 | graph | KEDA 1→4 on lag | low volume, but see below |
 | retraction | fixed 1 | correctness/compliance-sensitive, low volume |
 | other | fixed 1 | observability only, never the bottleneck |
@@ -263,7 +423,7 @@ continuous stream.
 
 ---
 
-## 5. Delivery semantics
+### D7 · Delivery semantics
 
 **At-least-once, no ordering guarantee across a destination.** Stated plainly
 because the alternatives are frequently claimed and rarely true.
@@ -289,45 +449,54 @@ because the alternatives are frequently claimed and rarely true.
 
 ---
 
-## 6. What the real data changed
+## 7. Failure modes
 
-I sampled the live firehose before writing the classifier rather than coding
-from the docs. Three findings changed the design:
+| Failure | Detected by | Behaviour | Blast radius |
+|---|---|---|---|
+| Upstream disconnect | `tap_connected` = 0 | Exponential backoff with jitter; resume from cursor | Ingest pauses; nothing lost |
+| Tap falls behind | `cursor_lag_seconds` | Readiness fails at 60s; shed policy bounds the queue | Freshness only |
+| Tap pod dies | Liveness / restart | New pod resumes from checkpoint minus 5s | Small replay |
+| One worker crashes | Consumer `num_pending` grows | Pod restarts, backlog drains, KEDA scales out | **That path only** |
+| Handler throws | `messages_handled{outcome}` | Nak with exponential delay, up to the redelivery budget | One message |
+| Poison message | `dlq_messages_total` | Published to that path's DLQ, then acked | One message |
+| Unparseable payload | Same | Straight to DLQ — retrying will never help | One message |
+| Broker unavailable | Publish errors | Cursor does not advance past failures; ingest degrades rather than crashing | Whole pipeline, recoverable |
+| Redis unavailable | Handler exceptions | Nak and retry; windows rebuild within one window | Stateful paths |
+| Unknown event type | `unmapped-collection` rate | Routed to `other` and counted | None — this is the signal to build a path |
 
-1. **Deletes carry no `record`** — only `collection` and `rkey`. So referential
-   cleanup is *impossible* without an index the create path writes
-   (`(did, collection, rkey) -> subject_uri`). At firehose volume that is a
-   write per engagement event, purely to make deletes resolvable. Whether that
-   is worth paying depends on whether counts must be exact; for a signal, no. So
-   the retraction path records the retraction (which is genuinely useful — "was
-   this deleted?" is what compliance needs) and exposes the gap as
-   `jsr_retractions_total{resolution="no-index"}` rather than pretending the
-   cleanup happened.
-2. **The volume skew is extreme.** Measured on this cluster: engagement 35,867
-   events vs graph 337 in the same interval — a ~106× spread across paths
-   sharing one ingest. That is the empirical case for per-path scaling; a
-   uniform worker pool would be simultaneously starved and wasteful.
-3. **Naive keyword matching is unusable.** With `ai` in the keyword list,
-   `"ai" in text` fires on *said*, *again*, *email*, *Dubai*. Against live data
-   that was nearly every match. The fix is a word boundary — but expressed as
-   `(?<!\w)…(?!\w)`, not `\b`: `\b` is a *transition*, so `\bc\+\+\b` matches
-   nothing at all, since the character after `+` would have to be a word
-   character. My own test for `c++` caught that. A notification path that cries
-   wolf is worse than no notification path.
+**Ordering matters in the DLQ path.** A message that exhausts its redelivery
+budget is published to the DLQ subject and *then* acked off the main consumer.
+Crashing between those two steps duplicates into the DLQ, which is recoverable;
+acking first would lose it outright. This is the kind of detail that is
+invisible until the day it matters, which is why it lives in one shared runner
+rather than being reimplemented per handler.
 
-**On content handling.** This is a public, unfiltered firehose. Post text is
-matched against, never emitted: alerts carry the DID, record key and which
-keyword hit, plus text length — not the text. Logs are the easiest place to
-accidentally build a permanent, widely-readable copy of exactly the content you
-were told to be careful with. Similarly, `collection` is user-extensible in the
-AT Protocol, so it is bounded to a known set before being used as a metric
-label — otherwise a stranger can mint unbounded Prometheus series from the
-public internet and take out your monitoring during the incident you needed it
-for.
+**Verified, not asserted.** `make chaos` deletes the busiest worker. With
+engagement (79% of traffic) down for ~30 seconds, content processed 1,067 more
+events and retraction 258, uninterrupted; engagement's consumer drained back to
+zero pending on restart.
 
 ---
 
-## 7. Known limitations
+## 8. Delivery plan
+
+Phases 0–1 are complete and running. The rest is ordered by risk retired per
+unit of effort, not by how interesting the work is.
+
+| Phase | Work | Exit criteria |
+|---|---|---|
+| **0 · done** | Classifier, tap, four paths, broker, kind manifests, tests | One command deploys; all paths alert on live data |
+| **1 · done** | Per-path consumers, DLQs, KEDA on lag, chaos test, metrics, lag-gated readiness | Killing the busiest worker measurably does not affect the others |
+| **2** | **Close the DLQ hole** — replay worker + alert on DLQ depth. A dead-letter queue nobody reads is a data-loss mechanism with extra steps, and replay is genuinely intermittent work, so it is the correct home for scale-to-zero | A poisoned message can be fixed and replayed without a deploy |
+| **3** | Real infrastructure — clustered broker with PVs (or Kafka, where partitions map onto per-actor sharding better); managed Redis. Not a code change of consequence, which was the point of the store interface | No single pod loses state; broker survives a node failure |
+| **4** | SLOs on the numbers that already exist — alert on cursor lag, shed rate, per-consumer pending, DLQ depth | Every failure mode in §7 has a corresponding alert |
+| **5** | Per-destination backpressure — split the tap's queue so retraction can `block` while engagement `shed`s | The correctness-sensitive path is lossless under overload |
+| **6** | Shard the tap by DID with disjoint server-side filters + a coordinator | Ingest throughput scales horizontally |
+| **7** | Deduplication on `did+collection+rkey+rev`, if exactness is ever required. Last deliberately: it adds a store to size and evict | Counters are replay-safe |
+
+---
+
+## 9. Risks and known gaps
 
 Things I know are wrong or missing, rather than things I hope nobody notices:
 
@@ -353,27 +522,26 @@ Things I know are wrong or missing, rather than things I hope nobody notices:
   the point where the shed policy engages, so that path is tested by unit test
   rather than in anger.
 
-## 8. Prototype → production
+---
 
-In the order I would actually do it:
+## 10. Code map — read in this order
 
-1. **Replace the DLQ hole** with a replay worker and an alert on DLQ depth. A
-   dead-letter queue nobody reads is a data-loss mechanism with extra steps.
-2. **Real infrastructure**: NATS clustered with persistent volumes (or Kafka —
-   partitions map onto the per-DID sharding story better, and a consumer group
-   per path is the same isolation model); Redis → ElastiCache or DynamoDB.
-3. **Per-destination backpressure policy**, and split the tap's queue.
-4. **Shard the tap** by DID via `wantedDids` once one process is the ceiling,
-   with a coordinator owning shard assignment.
-5. **Deduplication** on `did+collection+rkey+rev` if counts ever need to be
-   exact.
-6. **SLOs on the numbers that already exist**: alert on `cursor_lag_seconds`,
-   `events_shed_total`, per-consumer pending, and DLQ depth. The instrumentation
-   is in; the alerting is not.
-7. **Schema contract** — validate against the lexicon and route validation
-   failures to their own path rather than counting them as malformed.
+| File | What to look at | Decision |
+|---|---|---|
+| `router/routing.py` | `classify()` — the precedence chain, and `None` vs `OTHER` | §4 |
+| `tests/test_routing.py` | Delete precedence, parametrised across the whole table | §4 |
+| `router/tap.py` | `_enqueue()` shed policy; `load_cursor()`; the reconnect loop | §6 D1–D3 |
+| `tests/test_tap.py` | The fake Jetstream server — reconnect and resume, made deterministic with an explicit gate | §6 D3 |
+| `router/workers/runner.py` | `_process()` ack/nak/DLQ; `_to_dlq()` ordering; SIGTERM drain | §7 |
+| `router/windows.py` | Bucketed counters and the store interface both targets implement | §6 D5 |
+| `router/workers/retraction.py` | The missing-index limitation, surfaced as a metric | §3, §9 |
+| `router/workers/content.py` | `compile_keywords()` — why the boundary is a lookaround, not `\b` | §3 |
+| `k8s/50-keda.yaml` | The scale-to-zero correction, with the KEDA logs kept in the comment | §6 D6 |
+| `infra/cdk/app.py` | Fargate tap, per-path reserved concurrency, batch windows | §6 D1, D4 |
 
-## 9. What I deliberately did not build
+---
+
+## 11. What I deliberately did not build
 
 Multi-region, exactly-once, a UI, authentication, a schema registry, per-tenant
 isolation, and a Grafana dashboard. Four paths wired end-to-end with the failure

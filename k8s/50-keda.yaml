@@ -28,7 +28,7 @@ spec:
   scaleTargetRef:
     name: engagement-worker
   # The high-volume path. Never idles to zero in practice because likes are
-  # ~70% of the firehose, but it does need headroom for bursts.
+  # ~79% of routed traffic, but it does need headroom for bursts.
   minReplicaCount: 1
   maxReplicaCount: 6
   pollingInterval: 10
@@ -60,7 +60,7 @@ spec:
   scaleTargetRef:
     name: graph-worker
   # This was minReplicaCount: 0 — the headline "serverless scale-to-zero" case,
-  # since this is the lowest-volume path (~1% of events) and a follow-burst
+  # since this is the lowest-volume real path (~5.6% of events) and a follow-burst
   # alert arriving a few seconds late costs nothing.
   #
   # I measured it, and it was wrong. KEDA logs from that run:

@@ -65,11 +65,11 @@ PATH_CONFIG = {
     # batch small. Reserved concurrency also stops the noisy engagement path
     # from consuming the whole account's Lambda budget and starving this one.
     "content": {"batch": 10, "window": 0, "reserved": 20, "timeout": 30},
-    # ~70% of firehose volume. Large batches amortise invocation cost, and a
+    # ~79% of routed volume. Large batches amortise invocation cost, and a
     # batching window trades a little latency for far fewer invocations —
     # the single biggest cost lever in this design.
     "engagement": {"batch": 500, "window": 5, "reserved": 50, "timeout": 60},
-    # ~1% of volume. Small and cheap; cold starts are irrelevant here.
+    # ~5.6% of volume. Small and cheap; cold starts are irrelevant here.
     "graph": {"batch": 100, "window": 5, "reserved": 10, "timeout": 30},
     # Correctness-sensitive: modest batches so one poison message quarantines
     # less collateral work on retry.

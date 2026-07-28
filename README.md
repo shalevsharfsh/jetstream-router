@@ -81,7 +81,7 @@ nature — lower `FOLLOW_THRESHOLD` in `k8s/20-config.yaml` to force it.
 make chaos
 ```
 
-Deletes the engagement worker — the busiest path, ~70% of all traffic — and
+Deletes the engagement worker — the busiest path, ~79% of all traffic — and
 shows the other three continuing without a blip, then engagement draining its
 backlog on restart. That single command is the property the whole design exists
 to provide. Measured on this cluster: with engagement down for ~30s, content
@@ -95,7 +95,7 @@ ones:
 
 | Setting | Default | Why you'd change it |
 |---|---|---|
-| `TAP_BACKPRESSURE_POLICY` | `shed` | `shed` drops the oldest queued events under overload and stays current; `block` stops reading the socket and loses nothing but falls behind. The most consequential setting in the service — see DESIGN.md. |
+| `TAP_BACKPRESSURE_POLICY` | `shed` | `shed` drops the oldest queued events under overload and stays current; `block` stops reading the socket and loses nothing but falls behind. The most consequential setting in the service — see DESIGN.md §6. |
 | `TAP_QUEUE_MAXSIZE` | `10000` | How much latency is absorbed before that policy engages. |
 | `ROUTER_COLLECTION_ROUTES` | 4 collections | The routing table. Adding a collection to an existing path is a config change; adding a new *path* is not. |
 | `CONTENT_KEYWORDS` | common words | Deliberately common so the demo is not silent. |
@@ -135,7 +135,7 @@ tests/                  routing, workers, and a fake Jetstream server
 
 - **The tap is a singleton.** `replicas: 1` is a correctness constraint, not a
   capacity choice — two taps would double-publish everything. Scaling out means
-  partitioning by DID; described in DESIGN.md, not built.
+  partitioning by DID; described in DESIGN.md §9, not built.
 - **At-least-once, not exactly-once.** The cursor rewinds a few seconds on
   resume, deliberately reprocessing rather than risking a gap.
 - **NATS and Redis here are single-pod and ephemeral.** They make the topology

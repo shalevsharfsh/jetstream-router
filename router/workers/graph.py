@@ -7,7 +7,7 @@ both organic virality and coordinated inauthentic behaviour; distinguishing
 those two is a modelling problem well outside this exercise, so the handler
 raises the signal and says so rather than pretending to judge.
 
-Lowest-volume path in the sample (~3.6% of events), and entirely tolerant of a
+Lowest-volume real path (~5.6% of routed events), and entirely tolerant of a
 cold start — which is why this one scales from zero under KEDA.
 """
 

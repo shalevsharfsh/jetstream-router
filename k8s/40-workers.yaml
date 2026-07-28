@@ -58,8 +58,8 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
 
-# --- engagement: highest volume, scales 0..6 under KEDA --------------------
-# ~70% of firehose traffic. replicas is managed by the ScaledObject in
+# --- engagement: highest volume, scales 1..6 under KEDA --------------------
+# ~79% of routed traffic. replicas is managed by the ScaledObject in
 # 50-keda.yaml; the value here is only the pre-KEDA starting point.
 #
 # Safe to run multiple replicas because the aggregation state lives in Redis
@@ -111,9 +111,11 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
 
-# --- graph: lowest volume, scales to zero ----------------------------------
-# ~3.6% of traffic and entirely tolerant of a cold start, so this is the one
-# that genuinely idles at zero replicas between bursts.
+# --- graph: lowest-volume real path, scales 1..4 under KEDA ----------------
+# ~5.6% of routed traffic. This is the one I first set to scale to zero and then
+# had to correct: on a continuous stream it oscillated 1->0->1 every ~2 minutes,
+# and the scale cycle is longer than its own 60s detection window. See the note
+# in 50-keda.yaml.
 ---
 apiVersion: apps/v1
 kind: Deployment
