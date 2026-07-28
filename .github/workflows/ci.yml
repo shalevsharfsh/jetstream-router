@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install -r requirements-dev.txt
+          pip install pytest-timeout aws-cdk-lib constructs
+
+      - name: Lint
+        run: ruff check router tests
+
+      - name: Test
+        run: pytest -q --timeout=60
+
+      - name: Build image
+        run: docker build -t jetstream-router:ci .
+
+      # Proves the serverless target is real IaC rather than a diagram. It is
+      # never deployed — synth alone is the check.
+      - name: Synthesize the AWS stack
+        working-directory: infra/cdk
+        run: npx --yes aws-cdk@2 synth --quiet
