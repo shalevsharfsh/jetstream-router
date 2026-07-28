@@ -1,0 +1,79 @@
+# KEDA: serverless semantics for the two paths that can tolerate them.
+#
+# This is the part of the deployment that makes "scale independently" literal
+# rather than aspirational. Each ScaledObject watches ONE consumer's pending
+# count on the stream and scales ONLY that Deployment. A backlog on engagement
+# has no effect whatsoever on the graph worker's replica count, because they are
+# reading different numbers.
+#
+# Why queue depth rather than CPU: CPU is a lagging, indirect proxy. These
+# workers are I/O-bound (Redis round-trips), so they can be badly behind while
+# barely registering CPU load. Consumer lag is the thing we actually care about
+# and the thing a human would look at, so it is what we scale on. This is the
+# same signal AWS Lambda uses for an SQS event source; KEDA is how you get it
+# on Kubernetes.
+#
+# Only two of the five paths are here, deliberately:
+#   - content    stays at 1 — cold starts are user-visible on a notification path
+#   - retraction stays at 1 — correctness-sensitive, and low volume anyway
+#   - other      stays at 1 — pure observability, never the bottleneck
+# A uniform policy across all five would have been less code and worse thinking.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: engagement-worker
+  namespace: jetstream-router
+spec:
+  scaleTargetRef:
+    name: engagement-worker
+  # The high-volume path. Never idles to zero in practice because likes are
+  # ~70% of the firehose, but it does need headroom for bursts.
+  minReplicaCount: 1
+  maxReplicaCount: 6
+  pollingInterval: 10
+  cooldownPeriod: 60
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Scale down slowly. Aggressive scale-down on a bursty stream causes
+          # thrash: drop a replica, backlog returns, add it back. The cost of
+          # holding a pod for another two minutes is trivial next to that.
+          stabilizationWindowSeconds: 120
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.jetstream-router.svc.cluster.local:8222"
+        account: "$G"
+        stream: "BSKY"
+        consumer: "engagement-worker"
+        # Pending messages per replica before adding another.
+        lagThreshold: "500"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: graph-worker
+  namespace: jetstream-router
+spec:
+  scaleTargetRef:
+    name: graph-worker
+  # The genuine scale-to-zero case: lowest-volume path, and a follow-burst alert
+  # arriving a few seconds later because of a cold start costs nothing.
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  pollingInterval: 10
+  # cooldownPeriod is the wait after the last activity before scaling to zero,
+  # so the pod is not torn down and recreated between two normal gaps in follow
+  # traffic. (No idleReplicaCount here: KEDA requires it to be strictly below
+  # minReplicaCount, and minReplicaCount is already 0.)
+  cooldownPeriod: 90
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.jetstream-router.svc.cluster.local:8222"
+        account: "$G"
+        stream: "BSKY"
+        consumer: "graph-worker"
+        lagThreshold: "100"

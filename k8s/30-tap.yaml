@@ -1,0 +1,76 @@
+# The tap: the one component that must be a singleton.
+#
+# replicas: 1 is a correctness constraint, not a capacity choice. Two taps would
+# each hold their own WebSocket, receive the same events, and publish everything
+# twice — silently doubling every aggregate in the system. Horizontal scaling
+# here requires partitioning the stream by DID (Jetstream's wantedDids filter),
+# which is described in DESIGN.md and not built.
+#
+# strategy: Recreate rather than RollingUpdate for the same reason: a rolling
+# update would briefly run two taps.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tap
+  namespace: jetstream-router
+  labels: { app: tap, component: ingest }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: tap }
+  template:
+    metadata:
+      labels: { app: tap, component: ingest }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      # Long enough for the publisher to flush the queue and checkpoint the
+      # cursor. Must exceed the drain the process actually performs, or the
+      # kubelet SIGKILLs us mid-flush and we replay on restart.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: tap
+          image: jetstream-router:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "tap" }
+          envFrom:
+            - configMapRef: { name: router-config }
+          ports:
+            - { name: metrics, containerPort: 9090 }
+          # Liveness and readiness deliberately differ. Losing the upstream
+          # WebSocket makes the tap un-ready but not dead: restarting it would
+          # discard the reconnect backoff and hammer Jetstream. Only a wedged
+          # process should be killed.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9090 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9090 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 200m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tap
+  namespace: jetstream-router
+  labels: { app: tap }
+spec:
+  selector: { app: tap }
+  ports:
+    - { name: metrics, port: 9090, targetPort: 9090 }
