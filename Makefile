@@ -49,7 +49,7 @@ logs: ## Tail everything
 metrics: ## Print the tap's key metrics
 	@kubectl -n $(NS) port-forward svc/tap 9090:9090 >/dev/null 2>&1 & \
 	sleep 2; \
-	curl -s localhost:9090/metrics | grep -E '^jsr_(events|tap)' | grep -v '^#'; \
+	curl -s localhost:9090/metrics | grep -E '^jsr_(events|tap)' | grep -vE '^#|_created'; \
 	kill %1 2>/dev/null || true
 
 scale-watch: ## Watch KEDA scale the paths independently
