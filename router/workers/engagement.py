@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..observability import get_logger
-from ..windows import bump_and_total, claim_alert
 from .runner import WorkerContext
 
 log = get_logger("engagement")
@@ -63,14 +62,14 @@ class EngagementHandler:
             return
 
         settings = self.ctx.settings
-        total = await bump_and_total(
-            self.ctx.redis, NAMESPACE, uri, settings.engagement_window_s
+        total = await self.ctx.store.bump_and_total(
+            NAMESPACE, uri, settings.engagement_window_s
         )
         if total < settings.engagement_threshold:
             return
 
         # Threshold crossed. Fire once per window per URI, not once per event.
-        if not await claim_alert(self.ctx.redis, NAMESPACE, uri, settings.engagement_window_s):
+        if not await self.ctx.store.claim_alert(NAMESPACE, uri, settings.engagement_window_s):
             return
 
         self.ctx.alert(

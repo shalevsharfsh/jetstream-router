@@ -76,6 +76,33 @@ async def bump_and_total(
     return total + (int(current) if current else 0)
 
 
+class RedisWindowStore:
+    """Redis-backed implementation of the store interface handlers depend on.
+
+    Handlers talk to this rather than to a Redis client directly, which is what
+    lets the identical handler code run against DynamoDB on Lambda (see
+    ``aws_handlers.DynamoWindowStore``). The interface is deliberately tiny —
+    atomic increment over a window, a single-shot claim, and a durable mark —
+    because that is genuinely all four handlers need, and a small interface is
+    what makes a second implementation cheap rather than theoretical.
+    """
+
+    def __init__(self, redis: Any) -> None:
+        self.redis = redis
+
+    async def bump_and_total(
+        self, namespace: str, member: str, window_s: int, now: float | None = None
+    ) -> int:
+        return await bump_and_total(self.redis, namespace, member, window_s, now)
+
+    async def claim_alert(self, namespace: str, member: str, cooldown_s: int) -> bool:
+        return await claim_alert(self.redis, namespace, member, cooldown_s)
+
+    async def mark(self, key: str, ttl_s: int) -> None:
+        """Record that something happened, for ``ttl_s``."""
+        await self.redis.setex(key, ttl_s, "1")
+
+
 async def claim_alert(redis: Any, namespace: str, member: str, cooldown_s: int) -> bool:
     """Return True at most once per ``cooldown_s`` for a given member.
 

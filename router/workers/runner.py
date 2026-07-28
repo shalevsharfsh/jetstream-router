@@ -37,6 +37,7 @@ from ..observability import (
     start_http_server,
 )
 from ..routing import Destination
+from ..windows import RedisWindowStore
 
 log = get_logger("worker")
 
@@ -54,14 +55,18 @@ class Handler(Protocol):
 class WorkerContext:
     """Shared dependencies handed to handlers.
 
-    Handlers get state through this rather than reaching for globals, so a test
-    can pass a fakeredis instance and a tweaked Settings and exercise the real
-    logic with no infrastructure at all.
+    ``store`` is an interface, not a Redis client: on Kubernetes it is
+    ``RedisWindowStore``, on Lambda it is ``DynamoWindowStore``. Handlers are
+    written against the interface, which is what makes them genuinely portable
+    between the two deployment targets rather than nominally so.
+
+    It also means a test can pass a fakeredis-backed store and a tweaked
+    Settings and exercise the real handler logic with no infrastructure at all.
     """
 
-    def __init__(self, settings: Settings, redis: aioredis.Redis) -> None:
+    def __init__(self, settings: Settings, store: Any) -> None:
         self.settings = settings
-        self.redis = redis
+        self.store = store
 
     def alert(self, worker: str, alert: str, **context: Any) -> None:
         """Emit downstream 'work'.
@@ -170,7 +175,7 @@ class Worker:
         self.nc = await nats.connect(s.nats_url, max_reconnect_attempts=-1, reconnect_time_wait=1)
         self.js = self.nc.jetstream()
 
-        await self.handler.setup(WorkerContext(s, self.redis))
+        await self.handler.setup(WorkerContext(s, RedisWindowStore(self.redis)))
 
         sub = await self.js.pull_subscribe(
             subject=self.destination.subject,

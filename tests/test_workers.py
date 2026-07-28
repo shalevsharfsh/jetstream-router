@@ -13,7 +13,7 @@ import pytest
 
 from router.config import Settings
 from router.observability import ALERTS_RAISED
-from router.windows import bump_and_total, claim_alert
+from router.windows import RedisWindowStore, bump_and_total, claim_alert
 from router.workers.content import ContentHandler
 from router.workers.engagement import EngagementHandler, subject_uri
 from router.workers.graph import GraphHandler, followee_did
@@ -27,7 +27,7 @@ def redis():
 
 def ctx(redis, **overrides) -> WorkerContext:
     settings = Settings(**overrides)
-    return WorkerContext(settings, redis)
+    return WorkerContext(settings, RedisWindowStore(redis))
 
 
 def like(uri: str, did: str = "did:plc:actor") -> dict:
@@ -171,6 +171,45 @@ async def test_content_matches_keywords_case_insensitively(redis) -> None:
     await handler.setup(ctx(redis, keywords=["kubernetes"], languages=[]))
     before = alert_count("content", "keyword-match")
     await handler.handle(post("Deploying KUBERNETES today"), {})
+    assert alert_count("content", "keyword-match") == before + 1
+
+
+async def test_content_matches_whole_words_not_substrings(redis) -> None:
+    """Regression test for a real false-positive storm.
+
+    A naive ``keyword in text`` check with "ai" in the list fires on "said",
+    "again", "email" and "chair". Against the live firehose that was the
+    overwhelming majority of matches — a notification path that cries wolf is
+    worse than no notification path.
+    """
+    handler = ContentHandler()
+    await handler.setup(ctx(redis, keywords=["ai"], languages=[]))
+
+    before = alert_count("content", "keyword-match")
+    for decoy in ("she said hello", "here we go again", "check your email",
+                  "sat on a chair", "in Dubai today"):
+        await handler.handle(post(decoy), {})
+    assert alert_count("content", "keyword-match") == before, "matched a substring"
+
+    # The genuine article still matches, punctuation and all.
+    await handler.handle(post("thoughts on AI, generally?"), {})
+    assert alert_count("content", "keyword-match") == before + 1
+
+
+async def test_content_matches_multi_word_keywords(redis) -> None:
+    handler = ContentHandler()
+    await handler.setup(ctx(redis, keywords=["prompt injection"], languages=[]))
+    before = alert_count("content", "keyword-match")
+    await handler.handle(post("a classic prompt injection attack"), {})
+    assert alert_count("content", "keyword-match") == before + 1
+
+
+async def test_content_keywords_with_regex_characters_are_literal(redis) -> None:
+    """Keywords come from a ConfigMap; a stray '.' must not become a wildcard."""
+    handler = ContentHandler()
+    await handler.setup(ctx(redis, keywords=["c++"], languages=[]))
+    before = alert_count("content", "keyword-match")
+    await handler.handle(post("rewriting it in c++ today"), {})
     assert alert_count("content", "keyword-match") == before + 1
 
 

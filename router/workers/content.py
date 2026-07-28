@@ -16,6 +16,7 @@ were told to be careful with.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..observability import get_logger
@@ -25,17 +26,49 @@ from .runner import WorkerContext
 log = get_logger("content")
 
 
+def compile_keywords(keywords: list[str]) -> list[tuple[str, re.Pattern[str]]]:
+    """Compile keywords to word-boundary patterns.
+
+    Naive substring matching is the obvious implementation and it is wrong in a
+    way that only shows up against real data: with ``ai`` in the keyword list,
+    ``"ai" in text`` fires on *said*, *again*, *email* and *chair*. Running this
+    against the live firehose produced a stream of matches that were almost all
+    false positives — which would be worse than useless on a notification path,
+    because it trains whoever receives them to ignore them.
+
+    The boundary is expressed as ``(?<!\\w) ... (?!\\w)`` rather than ``\\b``.
+    ``\\b`` is a *transition* between a word and non-word character, so it can
+    never match next to a keyword that itself ends in punctuation: ``\\bc\\+\\+\\b``
+    matches nothing at all, because the character after ``+`` would have to be a
+    word character. The lookaround form asks the question we actually mean —
+    "not glued to a word" — and handles ``c++``, ``.NET`` and ``ai`` alike.
+
+    Known limitation: word characters are undefined for scripts that do not
+    delimit words with spaces (Japanese, Chinese, Thai), where this will not
+    match mid-string. Doing that properly needs segmentation, which is well
+    outside this exercise — so the language filter is the honest mitigation,
+    and the limitation is stated rather than hidden.
+    """
+    compiled = []
+    for keyword in keywords:
+        pattern = re.compile(rf"(?<!\w){re.escape(keyword)}(?!\w)", re.IGNORECASE)
+        compiled.append((keyword, pattern))
+    return compiled
+
+
 class ContentHandler:
     name = "content"
 
     def __init__(self) -> None:
         self.ctx: WorkerContext | None = None
-        self.keywords: list[str] = []
+        self.keywords: list[tuple[str, re.Pattern[str]]] = []
         self.languages: set[str] = set()
 
     async def setup(self, ctx: WorkerContext) -> None:
         self.ctx = ctx
-        self.keywords = [k.lower() for k in ctx.settings.keywords]
+        # Compiled once at startup, not per event: this runs on every post on
+        # the firehose, so re-compiling would be the hot loop.
+        self.keywords = compile_keywords(ctx.settings.keywords)
         self.languages = {lang.lower() for lang in ctx.settings.languages}
         log.info(
             "content handler ready",
@@ -62,8 +95,7 @@ class ContentHandler:
         if self.languages and not (langs & self.languages):
             return
 
-        haystack = text.lower()
-        matched = [kw for kw in self.keywords if kw in haystack]
+        matched = [keyword for keyword, pattern in self.keywords if pattern.search(text)]
         if not matched:
             return
 

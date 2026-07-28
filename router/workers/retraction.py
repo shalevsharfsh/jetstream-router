@@ -72,10 +72,9 @@ class RetractionHandler:
         # Durable record of the retraction itself. This is the part that is
         # genuinely useful without an index: "was this record deleted?" is
         # answerable, which is what a compliance or moderation path needs.
-        await self.ctx.redis.setex(
+        await self.ctx.store.mark(
             f"{NAMESPACE}:{did}:{collection}:{rkey}",
             self.ctx.settings.engagement_window_s * 4,
-            "1",
         )
 
         unresolvable = collection in COUNTED_COLLECTIONS
