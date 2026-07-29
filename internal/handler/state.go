@@ -1,5 +1,5 @@
-// Package state holds the bounded, single-owner data structures the stateful
-// handlers use.
+// Bounded data structures for the stateful routes: a sliding window, a dedup
+// set and an alert throttle.
 //
 // Two rules run through all of it.
 //
@@ -14,9 +14,10 @@
 // burst of simultaneous activity and fire a false alert on exactly the path
 // that recovery exercises most.
 //
-// Nothing here takes a lock. Each instance is owned by exactly one goroutine —
-// one worker of one route — and events are sharded to that worker by key, so
-// each key has precisely one owner (D3).
+// Nothing here takes a lock, because nothing here is shared: each instance
+// belongs to exactly one shard, and shardSet holds the mutex that serialises
+// access to it (D3). Keeping the locking one level up means these three types
+// stay plain data structures that a test can drive directly.
 package handler
 
 import "container/list"

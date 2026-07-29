@@ -1,4 +1,4 @@
-// Package ingest owns the single WebSocket, the connection state machine and
+// Package jetstream owns the single WebSocket, the connection state machine and
 // the cursor.
 //
 // This is the one component that cannot be replicated. Jetstream is one socket
