@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -32,6 +33,9 @@ import (
 // healthyFor is how long a connection must hold before the reconnect backoff
 // is considered to have served its purpose and resets.
 const healthyFor = time.Minute
+
+// defaultIdleTimeout applies when the caller leaves IdleTimeout unset.
+const defaultIdleTimeout = 30 * time.Second
 
 // State is the connection lifecycle. Keeping cursor handling, backoff and
 // replay detection in one explicit state machine is considerably clearer than
@@ -79,8 +83,14 @@ type Config struct {
 	// MaxFrameBytes rejects oversized frames at the edge. Every field on this
 	// stream is attacker-controlled, so the parser gets a limit.
 	MaxFrameBytes int64
-	BackoffMax    time.Duration
-	CommitEvery   time.Duration
+	// IdleTimeout bounds a single Read. Without it a half-open connection —
+	// one the kernel still believes is established because no FIN ever
+	// arrived — blocks the read loop forever. The firehose delivers hundreds
+	// of events a second, so any silence beyond a few seconds means the
+	// connection is gone whatever the socket claims.
+	IdleTimeout time.Duration
+	BackoffMax  time.Duration
+	CommitEvery time.Duration
 }
 
 // Ingestor reads the stream and hands events to a dispatcher.
@@ -92,9 +102,18 @@ type Ingestor struct {
 	log    *slog.Logger
 
 	state State
+	// connected is read from the maintenance goroutine, so it cannot be the
+	// State field, which the read loop owns.
+	connected atomic.Bool
 }
 
 func New(cfg Config, cur *Cursor, d Dispatcher, h *obs.Health, log *slog.Logger) *Ingestor {
+	// A zero IdleTimeout would make every Read expire immediately rather than
+	// never — the opposite of what an unset field should mean. Normalise it
+	// here so a caller that has not thought about it gets the safe reading.
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
+	}
 	return &Ingestor{
 		cfg: cfg, cursor: cur, disp: d, health: h,
 		log: log.With("component", "ingest"), state: StateDisconnected,
@@ -153,7 +172,7 @@ func (in *Ingestor) subscribeURL() (string, error) {
 
 // Run reads until ctx is cancelled, reconnecting forever.
 func (in *Ingestor) Run(ctx context.Context) {
-	go in.commitLoop(ctx)
+	go in.maintenanceLoop(ctx)
 
 	attempt := 0
 	for ctx.Err() == nil {
@@ -233,11 +252,24 @@ func (in *Ingestor) connectAndRead(ctx context.Context) error {
 	} else {
 		in.setState(StateLive)
 	}
+	in.connected.Store(true)
+	defer in.connected.Store(false)
 	in.health.SetReady(true, "connected")
 
 	for {
-		_, data, err := conn.Read(ctx)
+		// Bounded read. A half-open connection produces no bytes and no error,
+		// so without a deadline this loop is where the process goes to die
+		// quietly — still "connected", still reporting ready, processing
+		// nothing. The timeout turns that into an ordinary read error, which
+		// the state machine already knows how to handle.
+		readCtx, cancelRead := context.WithTimeout(ctx, in.cfg.IdleTimeout)
+		_, data, err := conn.Read(readCtx)
+		cancelRead()
 		if err != nil {
+			if ctx.Err() == nil && readCtx.Err() != nil {
+				in.log.Warn("no frames within the idle timeout; treating the connection as dead",
+					"idle_timeout_seconds", in.cfg.IdleTimeout.Seconds())
+			}
 			return err
 		}
 		obs.EventsReceived.Inc()
@@ -255,27 +287,49 @@ func (in *Ingestor) connectAndRead(ctx context.Context) error {
 
 		// Advance regardless of whether the dispatch was accepted. See Cursor.
 		in.cursor.Advance(ev.TimeUS)
-		in.updateLag()
+
+		// Only the Replaying -> Live transition stays here, because it is the
+		// one thing that genuinely requires a read to have happened. The lag
+		// signal and readiness are refreshed on a timer instead; see
+		// maintenanceLoop.
+		if in.state == StateReplaying && in.cursor.Lag() <= in.cfg.LiveThreshold {
+			in.setState(StateLive)
+		}
 	}
 }
 
-func (in *Ingestor) updateLag() {
+// refreshLag publishes the lag signal and gates readiness on it.
+//
+// Called from the maintenance ticker rather than the read loop, and that
+// separation is the whole point. Readiness fails on cursor lag (D5) — but if
+// lag were only recomputed after a successful read, a wedged read loop would
+// freeze the metric at its last healthy value and the pod would report ready
+// forever while processing nothing. A health signal must not be computed by the
+// code path it exists to check.
+//
+// Safe to call from another goroutine: Health is atomic, Prometheus gauges are
+// concurrency-safe, and the connection state is read through an atomic rather
+// than the State field the read loop owns.
+func (in *Ingestor) refreshLag() {
+	if in.cursor.Latest() == 0 {
+		return // nothing seen yet; lag is meaningless
+	}
 	lag := in.cursor.Lag()
 	obs.CursorLag.Set(lag.Seconds())
 
-	if in.state == StateReplaying && lag <= in.cfg.LiveThreshold {
-		in.setState(StateLive)
+	if !in.connected.Load() {
+		return // Run() owns the readiness message while disconnected
 	}
-
-	switch {
-	case lag > in.cfg.MaxLag:
+	if lag > in.cfg.MaxLag {
 		in.health.SetReady(false, fmt.Sprintf("lagging %.0fs", lag.Seconds()))
-	default:
-		in.health.SetReady(true, fmt.Sprintf("lag %.1fs", lag.Seconds()))
+		return
 	}
+	in.health.SetReady(true, fmt.Sprintf("lag %.1fs", lag.Seconds()))
 }
 
-func (in *Ingestor) commitLoop(ctx context.Context) {
+// maintenanceLoop persists the cursor and refreshes the lag signal on a fixed
+// interval, independent of whether any frames are arriving.
+func (in *Ingestor) maintenanceLoop(ctx context.Context) {
 	t := time.NewTicker(in.cfg.CommitEvery)
 	defer t.Stop()
 	for {
@@ -284,6 +338,7 @@ func (in *Ingestor) commitLoop(ctx context.Context) {
 			if err := in.cursor.Commit(); err != nil {
 				in.log.Error("cursor commit failed", "error", err.Error())
 			}
+			in.refreshLag()
 		case <-ctx.Done():
 			return
 		}

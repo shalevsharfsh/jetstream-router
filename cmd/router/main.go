@@ -151,6 +151,7 @@ func ingestConfig(cfg config.Config, router *routing.Router) jetstream.Config {
 		LiveThreshold:     cfg.Jetstream.LiveThreshold.D(),
 		MaxLag:            cfg.Jetstream.MaxLag.D(),
 		MaxFrameBytes:     cfg.Jetstream.MaxFrameBytes,
+		IdleTimeout:       cfg.Jetstream.IdleTimeout.D(),
 		BackoffMax:        cfg.Jetstream.BackoffMax.D(),
 		CommitEvery:       cfg.Jetstream.CommitEvery.D(),
 	}

@@ -46,6 +46,7 @@ type Jetstream struct {
 	LiveThreshold Duration `json:"live_threshold"`
 	MaxLag        Duration `json:"max_lag"`
 	MaxFrameBytes int64    `json:"max_frame_bytes"`
+	IdleTimeout   Duration `json:"idle_timeout"`
 	BackoffMax    Duration `json:"backoff_max"`
 	CommitEvery   Duration `json:"commit_every"`
 }
@@ -112,8 +113,11 @@ func Default() Config {
 			LiveThreshold: Duration(3 * time.Second),
 			MaxLag:        Duration(60 * time.Second),
 			MaxFrameBytes: 1 << 20, // every field on this stream is attacker-controlled
-			BackoffMax:    Duration(30 * time.Second),
-			CommitEvery:   Duration(time.Second),
+			// The firehose never goes quiet for this long; silence means the
+			// connection is half-open whatever the socket reports.
+			IdleTimeout: Duration(30 * time.Second),
+			BackoffMax:  Duration(30 * time.Second),
+			CommitEvery: Duration(time.Second),
 		},
 		Admin: Admin{Addr: ":8080"},
 		Routing: routing.Table{

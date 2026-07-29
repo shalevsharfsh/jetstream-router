@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -131,6 +132,7 @@ func testConfig(u string) Config {
 		LiveThreshold: 3 * time.Second,
 		MaxLag:        60 * time.Second,
 		MaxFrameBytes: 1 << 20,
+		IdleTimeout:   30 * time.Second,
 		BackoffMax:    50 * time.Millisecond,
 		CommitEvery:   10 * time.Millisecond,
 	}
@@ -349,3 +351,66 @@ func TestCursorCommitIsAtomicAndReloadable(t *testing.T) {
 }
 
 var _ = json.Marshal
+
+// A silent connection must be detected and recycled.
+//
+// The failure this guards against is not a crash — it is the opposite. A
+// half-open connection produces no bytes and no error, so an unbounded Read
+// blocks forever while the socket still reports established. The process stays
+// up, stays "connected", and processes nothing.
+func TestSilentConnectionIsTimedOutAndReconnected(t *testing.T) {
+	// A server that completes the handshake, sends one frame, then says nothing.
+	f := newFakeJetstream([]string{postFrame(time.Now().UnixMicro())}, nil)
+	defer f.Close()
+
+	cfg := testConfig(f.url())
+	cfg.IdleTimeout = 250 * time.Millisecond
+	cfg.BackoffMax = 20 * time.Millisecond
+
+	rec := newRecorder()
+	cur := NewCursor(filepath.Join(t.TempDir(), "cursor.json"))
+	in := New(cfg, cur, rec, obs.NewHealth(), quietLog())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go in.Run(ctx)
+
+	// Without a read deadline the ingestor sits on the first connection forever.
+	waitFor(t, func() bool { return len(f.connections()) >= 2 },
+		"the idle timeout to recycle a silent connection")
+}
+
+// Readiness must not be computed by the loop it is meant to be checking.
+//
+// Lag gates readiness (D5). If lag were only recalculated after a successful
+// read, a wedged read loop would freeze it at its last healthy value and the pod
+// would report ready forever while processing nothing — a health check that
+// cannot observe its own failure mode.
+func TestLagIsRefreshedWithoutReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cursor.json")
+	cur := NewCursor(path)
+
+	// A position two hours old, as a stalled ingestor would leave behind.
+	cur.Advance(time.Now().Add(-2 * time.Hour).UnixMicro())
+
+	f := newFakeJetstream(nil, nil) // accepts, then silence
+	defer f.Close()
+
+	cfg := testConfig(f.url())
+	cfg.MaxLag = time.Minute
+	cfg.CommitEvery = 20 * time.Millisecond
+	cfg.IdleTimeout = time.Hour // deliberately useless, to isolate the refresh path
+
+	health := obs.NewHealth()
+	in := New(cfg, cur, newRecorder(), health, quietLog())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go in.Run(ctx)
+
+	// No frame ever arrives, so nothing in the read loop runs. Readiness has to
+	// fail anyway, driven by the maintenance ticker.
+	waitFor(t, func() bool {
+		return strings.HasPrefix(health.Detail(), "lagging")
+	}, "readiness to fail on lag with no reads at all")
+}

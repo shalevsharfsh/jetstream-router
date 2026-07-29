@@ -159,6 +159,19 @@ Liveness deliberately does not fail while disconnected — that would restart th
 backoff is working correctly. Readiness does, and also fails on excessive cursor lag: a process
 holding a healthy socket while two minutes behind is not working.
 
+Every read carries a deadline. A half-open connection — one the kernel still believes is
+established because no FIN ever arrived — produces no bytes and no error, so an unbounded read is
+where the process goes to die quietly: still connected, still reporting ready, processing nothing.
+The firehose never goes silent for thirty seconds, so silence is a dead connection whatever the
+socket claims, and the timeout turns it into an ordinary read error the state machine already
+handles.
+
+**Lag is recomputed on a timer, not after each read** — and that separation is deliberate.
+Readiness gates on lag, so computing lag inside the read loop would mean the health check could
+only observe failures the read loop survived. A wedged loop would freeze the metric at its last
+healthy value and the pod would report ready indefinitely. A health signal must not be produced by
+the code path it exists to check.
+
 The backoff resets after a connection that held; a counter that only climbs leaves a process pinned
 at maximum delay after a handful of blips. If the stored cursor predates the server's retention the
 gap is unrecoverable **and of unknown size** — there are no sequence numbers — so it is recorded
@@ -269,11 +282,15 @@ testing. Manual verification is a `kind` deploy with logs tailed against the rea
 
 ## 7. Defects the design did not prevent
 
-Six defects reached working code — three caught by running the service, three by a later review
-that read the code. **The design document caught none of them, and it explicitly forbade the worst
+Seven defects reached working code — three caught by running the service, four by later reviews
+that read it. **The design document caught none of them, and it explicitly forbade the worst
 one.**
 
-**Found by reading the code.** *The reader decoded the record body*, which D1 forbids in its own
+**Found by reading the code.** *No read deadline, and a health check that could not see its own
+failure* — the read used a process-lifetime context, so a half-open connection blocked forever; and
+because lag was recomputed only after a successful read, the readiness probe that exists to catch
+exactly that would have stayed green forever. Two individually reasonable choices whose interaction
+was a silent death with no alarm. *The reader decoded the record body*, which D1 forbids in its own
 words: selecting a per-worker queue needed a key from inside `commit.record`, so the enqueue path
 ran a full `json.Unmarshal` of every like and repost on the ingest goroutine — the busiest route's
 parse, on attacker-controlled nested content, decoded twice. The invariant existed before the code
