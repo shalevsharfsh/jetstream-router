@@ -7,6 +7,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -172,7 +173,15 @@ func Load(path string) (Config, error) {
 		}
 		return cfg, err
 	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
+	// Strict: a key that matches no field is an error, not a silent no-op.
+	// A config file the program ignores is worse than one it rejects — the
+	// operator believes a value took effect and nothing says otherwise. This
+	// repo shipped exactly that: local.config.json carried a "handlers" block
+	// left over from an earlier schema, so every local run quietly used the
+	// production thresholds instead of the lowered ones written in the file.
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return cfg, cfg.Validate()

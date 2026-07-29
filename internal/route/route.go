@@ -16,6 +16,7 @@
 package route
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,7 +96,13 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 		BlockTimeout string `json:"block_timeout"`
 	}{alias: (*alias)(c)}
 
-	if err := json.Unmarshal(b, &wire); err != nil {
+	// Strict, and it has to be repeated here: DisallowUnknownFields on the
+	// decoder in config.Load does not reach inside a custom UnmarshalJSON, so
+	// without this a typo in a route block would be silently ignored while the
+	// rest of the file was checked.
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
 		return err
 	}
 	for _, f := range []struct {

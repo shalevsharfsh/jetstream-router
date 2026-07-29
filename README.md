@@ -7,6 +7,8 @@ another.
 The reasoning behind the design — the options weighed, the decisions and their costs — is in
 [`DESIGN.md`](./DESIGN.md). That is the document to read first. This file is how to run it.
 
+[`AI.md`](./AI.md) covers how the agent was used, and where I overrode it.
+
 ## Requirements
 
 - Docker

@@ -1,10 +1,13 @@
 {
-  "jetstream": { "cursor_path": "./bin/cursor.json" },
-  "handlers": {
-    "keywords": ["kubernetes", "security", "agent", "bluesky"],
-    "languages": ["en"],
-    "engagement_threshold": 15,
-    "follow_threshold": 5,
-    "window_seconds": 60
+  "jetstream": {
+    "cursor_path": "./bin/cursor.json"
+  },
+  "keywords": ["kubernetes", "security", "agent", "bluesky"],
+  "languages": ["en"],
+  "thresholds": {
+    "engagement": 15,
+    "engagement_window": "1m",
+    "followBurst": 5,
+    "followBurst_window": "1m"
   }
 }

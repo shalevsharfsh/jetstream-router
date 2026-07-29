@@ -1,11 +1,5 @@
 # Design
 
-> **On length.** The brief asked for 1–3 pages; this is about five. It was eight, and I cut it by a
-> third. What I did not cut is sections 7 and 8 — the defects that reached working code, and what
-> is still missing — because they are the two I would least want a reader to skip. **If you only
-> have time for the design, read 1–5.** Sections 6–8 are what turns it from a claim into a checked
-> claim.
-
 ## 1. The problem
 
 One connection carries a heterogeneous, high-volume event stream. Every event must be classified
@@ -19,18 +13,18 @@ throughput of the entire stream.
 
 **A severely skewed type distribution.** Measured over 186,492 events, unfiltered:
 
-| Route | Events | Share |
-| --- | ---: | ---: |
-| engagement (like, repost) | 139,509 | 74.8% |
-| content (post) | 18,993 | 10.2% |
-| social-graph (follow) | 10,456 | 5.6% |
-| retraction (any delete) | 9,622 | 5.2% |
-| default (identity, account, unrouted) | 7,912 | 4.2% |
+| Route | Events | Share | ev/s |
+| --- | ---: | ---: | ---: |
+| engagement (like, repost) | 139,509 | 74.8% | 223 |
+| content (post) | 18,993 | 10.2% | 39 |
+| social-graph (follow) | 10,456 | 5.6% | 17 |
+| retraction (any delete) | 9,622 | 5.2% | 13 |
+| default (identity, account, unrouted) | 7,912 | 4.2% | 13 |
 
 A **13.3× spread** between the busiest and quietest real route sharing one ingest — any resource
 shared between them is monopolised by the former. And **4% of the stream is collections with no
 route at all**, which is the concrete argument for D4 and exactly what a server-side filter would
-have hidden.
+have hidden. One window, indicative rather than bounding.
 
 **No exactly-once delivery.** Reconnects resume from a `time_us` cursor, so duplicates are
 guaranteed and every handler must tolerate them.
@@ -43,9 +37,9 @@ other?**
 
 ## 2. Options considered
 
-**A — Inline dispatch.** Switch on type and handle the event in the reader loop. *Rejected:*
-head-of-line blocking. One slow call stalls the socket, the cursor stops advancing, and the
-server's replay window eventually laps us. This is the failure the exercise is really about.
+**A — Inline dispatch.** Handle the event in the reader loop. *Rejected:* head-of-line blocking.
+One slow call stalls the socket, the cursor stops advancing, and the server's replay window
+eventually laps us. This is the failure the exercise is really about.
 
 **B — One shared queue and a generic worker pool.** *Rejected:* decouples ingest from processing
 but gives no per-type isolation. A burst of likes fills the queue and follows wait behind it;
@@ -57,22 +51,21 @@ concurrency, retry policy, drop policy and metrics; a stalled route fills its ow
 nothing else's.
 
 *What C costs.* Capacity is fragmented — idle workers on a quiet route cannot help a saturated one
-— N buffers cost N times the memory of one, and there is more configuration to get wrong. The
-trade is utilisation for predictability: right when the distribution is this skewed and congestion
-behaviour is what is being judged; wrong under uniform load with similar handlers, where B is
-simpler and sufficient.
+— N buffers cost N times the memory, and there is more configuration to get wrong. The trade is
+utilisation for predictability: right when the distribution is this skewed and congestion behaviour
+is what is being judged; wrong under uniform load, where B is simpler and sufficient.
 
 *The honest limit.* Isolation is **between** routes, not **within** one. All five share a process,
 a scheduler, a heap and a garbage collector. D6 stops that shared fate being fatal; a broker is the
 real fix, which is why it leads section 5.
 
-**Also rejected.** *Per-type queues with a shared capped pool* — isolation on admission without
-fragmenting capacity, but a wedged worker in the shared pool still reaches every route. *An
-external broker* — the production answer, the wrong cost here; `Offer(ctx, event) bool` is narrow
-so it becomes a swap, not a rewrite. *Managed fan-out* — removes most of this code along with most
-of the reasoning being assessed. *Workflow orchestration* — wrong shape: single-hop dispatch at
-high volume, and the state that matters spans events rather than one execution. *Server-side
-filtering* — legitimate load shedding, but it discards the type mix this service exists to route.
+**Also rejected.** *Shared capped pool* — isolation on admission without fragmenting capacity, but
+a wedged worker still reaches every route. *External broker* — the production answer, the wrong
+cost here; `Offer(ctx, event) bool` is narrow so it becomes a swap, not a rewrite. *Managed
+fan-out* — removes most of this code along with most of the reasoning being assessed. *Workflow
+orchestration* — wrong shape: single-hop dispatch at high volume, and the state that matters spans
+events rather than one execution. *Server-side filtering* — legitimate load shedding, but it
+discards the type mix this service exists to route.
 
 ## 3. The chosen design
 
@@ -106,34 +99,22 @@ order of magnitude and in what a lost event costs.
 
 Sends into route channels are non-blocking; a full buffer drops the event and increments
 `events_dropped_total{route}`. Blocking would be real backpressure, but on a single shared reader
-blocking one route stalls *every* route — head-of-line blocking through the back door, with the
-slowest consumer dictating the throughput of the whole system.
+blocking one route stalls *every* route — head-of-line blocking through the back door.
 
-**A buffer is time, not space.** Size divided by arrival rate is how long that route can be
-completely stalled before it starts losing events, and that is the number worth choosing. Sized for
-about sixty seconds of tolerance at twice the measured mean rate:
-
-| Route | ev/s | Buffer | Stalled before loss |
-| --- | ---: | ---: | ---: |
-| engagement | 223 | 32,768 | 73s |
-| content | 39 | 4,096 | 53s |
-| social-graph | 17 | 2,048 | 60s |
-| retraction | 13 | 2,048 | 79s |
-| default | 13 | 2,048 | 79s |
+**A buffer is time, not space.** Size divided by arrival rate is how long a route can be completely
+stalled before it loses events, and that is the number worth choosing. Sized for roughly sixty
+seconds of tolerance at twice the measured mean rate, the five buffers give 53–79 seconds; the
+first, unmeasured attempt spanned 80–307 seconds — a 3.9× spread nobody had chosen.
 
 Both bounds are real. **Too small** and the route sheds on every ordinary burst, because traffic
-arrives in waves and the buffer exists for the peak rather than the mean. **Too large** and two
-worse things happen: events go stale — an alert derived from a ten-minute-old event is worth
-little, and in a detection context close to nothing — and *the failure hides*, because a route can
-be wedged for half an hour with its drop counter still reading zero. The drop counter is not only
-loss, it is the alarm.
+arrives in waves and the buffer exists for the peak. **Too large** and events go stale — an alert
+from a ten-minute-old event is worth little, and in a detection context close to nothing — and *the
+failure hides*: a route can be wedged for half an hour with its drop counter still at zero. **The
+drop counter is not only loss, it is the alarm.**
 
-The first sizing gave 80 to 307 seconds — a 3.9× spread nobody had chosen. Deriving them from
-measurement narrowed it to 1.5× on slightly less memory.
-
-`block` exists as a per-route policy for the retraction path, where a lost deletion is worse than a
-delayed one and congestion is implausible — and even it carries a timeout, so one route can never
-hold the stream hostage.
+`block` exists as a per-route policy for retraction, where a lost deletion is worse than a delayed
+one and congestion is implausible — and even it carries a timeout, so one route can never hold the
+stream hostage.
 
 The reader decodes only the three fields routing needs, leaving `commit.record` as raw bytes for
 the owning worker. **"The reader" means everything up to and including the enqueue** — a
@@ -146,9 +127,9 @@ independent positions and committing the minimum — real complexity in a pipeli
 at-least-once regardless.
 
 **Dropped events advance the cursor too, so shedding is irreversible.** The alternative is holding
-the cursor back on precisely the route that is already overloaded. Drops are permanent and
-unreplayable, not deferred — D1's sharpest edge, and why section 4 treats shedding as a security
-decision. A crash also loses whatever is buffered; section 5 fixes that first.
+the cursor back on precisely the route already overloaded. Drops are permanent and unreplayable,
+not deferred — D1's sharpest edge, and why section 4 treats shedding as a security decision. A
+crash also loses whatever is buffered; section 5 fixes that first.
 
 ### D3 — A key is mutated by one thing at a time
 
@@ -159,7 +140,7 @@ An earlier version had no locks — events were hashed to a worker *before* enqu
 key lives inside `commit.record`, so choosing the queue meant decoding on the ingest goroutine
 (section 7). **The guarantee is unchanged; the cost is a mutex**, which is the right way round: an
 uncontended lock is nanoseconds, while work on the shared reader is charged against the whole
-stream. Lock-free ownership was a means; per-key consistency was the end.
+stream. **Lock-free ownership was a means; per-key consistency was the end.**
 
 Hot keys remain the trade-off: a viral post serialises behind one shard's lock, and because the
 buffer is per-route, sustained pressure on one key can push the whole route into shedding.
@@ -178,21 +159,16 @@ outage.
 
 `Disconnected → Connecting → Replaying → Live`, plus `Reconnecting` with backoff and jitter.
 Liveness deliberately does not fail while disconnected — that would restart the pod at the moment
-backoff is working correctly. Readiness does, and also fails on excessive cursor lag: a process
-holding a healthy socket while two minutes behind is not working.
+backoff is working correctly. Readiness does, and also fails on excessive cursor lag.
 
-Every read carries a deadline. A half-open connection — one the kernel still believes is
-established because no FIN ever arrived — produces no bytes and no error, so an unbounded read is
-where the process goes to die quietly: still connected, still reporting ready, processing nothing.
-The firehose never goes silent for thirty seconds, so silence is a dead connection whatever the
-socket claims, and the timeout turns it into an ordinary read error the state machine already
-handles.
+**Every read carries a deadline.** A half-open connection produces no bytes and no error, so an
+unbounded read is where the process goes to die quietly: still connected, still reporting ready,
+processing nothing. The firehose never goes silent for thirty seconds, so silence is a dead
+connection whatever the socket claims.
 
-**Lag is recomputed on a timer, not after each read** — and that separation is deliberate.
-Readiness gates on lag, so computing lag inside the read loop would mean the health check could
-only observe failures the read loop survived. A wedged loop would freeze the metric at its last
-healthy value and the pod would report ready indefinitely. A health signal must not be produced by
-the code path it exists to check.
+**Lag is recomputed on a timer, not after each read.** Readiness gates on lag, so computing it
+inside the read loop would mean the health check could only observe failures the read loop
+survived. **A health signal must not be produced by the code path it exists to check.**
 
 The backoff resets after a connection that held; a counter that only climbs leaves a process pinned
 at maximum delay after a handful of blips. If the stored cursor predates the server's retention the
@@ -238,9 +214,8 @@ traffic shaped against it.
 
 - **Load shedding is an evasion primitive.** A dropped event is a missed detection and, per D2, it
   is gone for good. An adversary who can generate load can fill a buffer on purpose and hide inside
-  the discarded window. D1 stands for this prototype but is not a neutral default: in production a
-  durable broker removes the need to shed, and where it is unavoidable a detection route never
-  sheds. Every drop should raise an alert, not just a counter.
+  the discarded window. In production a durable broker removes the need to shed, and where it is
+  unavoidable a detection route never sheds. Every drop should raise an alert, not just a counter.
 - **Bounded queues, bounded state.** Capping channels while leaving aggregation maps unbounded only
   moves the exhaustion target. Writing the eviction is not the same as wiring it — a mistake this
   codebase actually made.
@@ -255,15 +230,15 @@ traffic shaped against it.
 - **Alert paths are rate-limited**; a threshold can be crossed deliberately, making an unthrottled
   alert path a remotely triggerable flood.
 - **Minimal data, minimal runtime.** Nothing persisted by default. Distroless, non-root, read-only
-  root filesystem, capabilities dropped, NetworkPolicy limiting egress to DNS and outbound TLS. The
-  service needs no credentials at all, and that is worth keeping true.
+  root filesystem, capabilities dropped, NetworkPolicy limiting egress. The service needs no
+  credentials at all, and that is worth keeping true.
 
 ## 5. From prototype to production
 
 | Concern | This prototype | Production |
 | --- | --- | --- |
 | Transport | In-process bounded channels | Kafka / NATS / SQS, one topic per route |
-| Aggregation state | Bounded in-memory maps, sharded under a mutex | Redis or DynamoDB with atomic increments — which removes the partitioning problem entirely |
+| Aggregation state | Bounded in-memory maps, sharded under a mutex | Redis or DynamoDB with atomic increments — removing the partitioning problem entirely |
 | Cursor | Local file, committed on enqueue | External store, committed on broker ack |
 | Failed events | Counted and logged | Per-route DLQ plus a replay tool |
 | Observability | Counters and structured logs | Alerting on drop rate, queue depth and cursor lag |
@@ -278,9 +253,9 @@ or `wantedDids`, each a strict singleton, with a deployment strategy that tears 
 brings up. The default rolling update briefly runs two pods, tolerable only because of D7.
 
 The AWS-native alternative — Fargate holding the connection, EventBridge to SNS/SQS, a Lambda per
-type — makes routing configuration rather than code and brings retries and DLQs off the shelf, at
-the cost of lock-in and much less control over batching and shedding. For a service whose value is
-how it behaves under congestion, that control is worth keeping.
+type — makes routing configuration rather than code, at the cost of lock-in and much less control
+over batching and shedding. For a service whose value is how it behaves under congestion, that
+control is worth keeping.
 
 ## 6. Scope and tests
 
@@ -290,53 +265,48 @@ tooling. The dispatch interface is the seam each attaches to.
 
 | Test | Why it matters |
 | --- | --- |
-| **Router table** | The core of the exercise. Covers a `delete` of each type, an `identity` event with no commit block, and an unknown collection reaching `default` |
+| **Router table** | Covers a `delete` of each type, an `identity` event with no commit block, and an unknown collection reaching `default` |
 | **Isolation under congestion** | The test that proves the architecture rather than asserting it |
 | **Panic containment** | The other half of that claim: without recovery, one bad record ends every route |
 | **Record decoded only by the worker** | Pins D1's decode budget after a review found it violated |
-| **Concurrent workers on one key** | D3 now relies on a lock, so the guarantee needs verifying under `-race` |
+| **Concurrent workers on one key** | D3 relies on a lock, so the guarantee needs verifying under `-race` |
 | **Window and threshold logic** | Fires once at the boundary, forgets old entries, uses event time |
-| **Cursor and idempotency** | Survives a simulated reconnect without a gap; the replayed overlap does not double-count |
+| **Cursor and idempotency** | Survives a simulated reconnect; the replayed overlap does not double-count |
 | **Integration** | A fake WebSocket server replays fixtures through the full pipeline |
 
-Not covered: the live connection (non-deterministic — a network test, not a logic test) and load
-testing. Manual verification is a `kind` deploy with logs tailed against the real firehose.
+Not covered: the live connection (a network test, not a logic test) and load testing. Manual
+verification is a `kind` deploy with logs tailed against the real firehose.
 
 ## 7. Defects the design did not prevent
 
 Seven defects reached working code — three caught by running the service, four by later reviews
-that read it. **The design document caught none of them, and it explicitly forbade the worst
-one.**
+that read it. **The design document caught none of them, and it explicitly forbade the worst one.**
 
 **Found by reading the code.** *No read deadline, and a health check that could not see its own
-failure* — the read used a process-lifetime context, so a half-open connection blocked forever; and
-because lag was recomputed only after a successful read, the readiness probe that exists to catch
-exactly that would have stayed green forever. Two individually reasonable choices whose interaction
-was a silent death with no alarm. *The reader decoded the record body*, which D1 forbids in its own
-words: selecting a per-worker queue needed a key from inside `commit.record`, so the enqueue path
-ran a full `json.Unmarshal` of every like and repost on the ingest goroutine — the busiest route's
-parse, on attacker-controlled nested content, decoded twice. The invariant existed before the code
-and the code broke it anyway, because "the reader" was read as "the read loop". *A TTL sweep that
-nothing called*, leaving only the size cap live. *A backoff counter that never reset*, pinning the
-process at maximum delay after a few brief blips.
+failure*: the read used a process-lifetime context, and because lag was recomputed only after a
+successful read, the probe that exists to catch exactly that would have stayed green forever — two
+reasonable choices whose interaction was a silent death with no alarm. *The reader decoded the
+record body*, which D1 forbids in its own words: selecting a per-worker queue needed a key from
+inside `commit.record`, so the enqueue path ran a full `json.Unmarshal` of every like and repost on
+the ingest goroutine. The invariant existed before the code and the code broke it anyway, because
+"the reader" was read as "the read loop". *A TTL sweep that nothing called*, leaving only the size
+cap live. *A backoff counter that never reset.*
 
 **Found by running it.** *A log-flood vector the security section did not prevent* — unknown
-collections were logged as a bounded bucket but throttled on the raw, attacker-supplied collection,
-so every novel lexicon earned its own line. *Configuration that could not load* — `block_timeout:
-"2s"` cannot unmarshal into a `time.Duration`, caught cleanly because config is validated at
+collections were throttled on the raw, attacker-supplied collection, so every novel lexicon earned
+its own line. *Configuration that could not load*, caught cleanly because config is validated at
 startup. *A test that passed for the wrong reason* — the isolation test's own control route was
 under-buffered and shedding, and the assertion was too weak to notice.
 
 **The pattern.** Each was written in the same confident register as the code that was correct.
-Three needed the service running; three needed someone reading the code *against* the document.
 Neither kind would have been found by reviewing the design — which is the argument for treating
-this document as a claim to be checked, not a record of what is true.
+this document as **a claim to be checked, not a record of what is true.**
 
 ## 8. Known gaps
 
 - **Isolation is between routes, not within one.** One process, one heap, one GC.
-- **A hot key degrades its whole route** — its updates serialise on one shard lock, and the buffer
-  is per-route rather than per-shard.
+- **A hot key degrades its whole route** — updates serialise on one shard lock, and the buffer is
+  per-route rather than per-shard.
 - **D3 costs a mutex.** Lock-free ownership is nicer, but the only way to get it was to decode on
   the reader — a worse trade this codebase made and had to undo.
 - **Nothing handles an event type needing state from two routes at once.** Either that state moves
