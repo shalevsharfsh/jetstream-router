@@ -34,6 +34,9 @@ I also wrote the out-of-scope list into the rules file. Left alone, agents build
 
 ## Prompts that did the real work
 
+Condensed — the originals were longer and more conversational — but each carries the instruction
+that was actually given, and the outcome described after it is what came back.
+
 ### 1. Sample the wire before writing the classifier
 
 > Before writing the classifier, connect to the live Jetstream and confirm the real payload shapes — especially what a `delete` actually carries.
@@ -57,11 +60,30 @@ Constraining it to *read and report* rather than *read and fix* was the point. A
 - **Option C had no stated cost** while A and B each had a crisp rejection. That asymmetry is the tell of a document rationalising a decision rather than making one.
 - **The skew was asserted, not measured.** Fixed by measuring it — the figures in section 1 are from a real run.
 
-### 4. Implementation, scoped by the contract rather than a feature list
+### 4. Implementation, against a contract I wrote first
 
-> Implement the tech stack according to this README and `CLAUDE.md`. Read the task brief again — they emphasise that the most important deliverables are `DESIGN.md` and `AI.md`.
+Before any code, I turned the settled design into two files: `README.md` — how the service runs,
+what is configurable, what the log output looks like — and `CLAUDE.md`, which restates each design
+decision as an invariant with its reason attached. Then:
 
-Pointing the implementation agent at files already in the repo is what kept scope under control: package layout, invariants, metric names and log messages were all settled, so there was nothing to negotiate. When it wanted to log a line per routed event, it flagged the conflict with the log-flood rule instead of just doing it — the rules file working as intended.
+> The design is settled and both files are in the repo. Build the service against them.
+>
+> Where they are specific — the package layout, the config schema, the metric names, the log
+> messages, the deployment shape — follow them exactly. Those are deliberate choices, not
+> suggestions, so do not improve on them. Where they are ambiguous or contradict each other, stop
+> and ask rather than picking a reading. If you think one of the invariants is wrong, tell me which
+> and why before you write any code.
+
+Writing the contract first is the part that mattered; the prompt is thin because it can be. Every
+decision an agent would otherwise invent plausibly and wrongly — where packages live, what the
+metrics are called, whether the ingest deployment is a `Deployment` or a `StatefulSet` — was
+already made, so there was nothing to negotiate and nothing to review afterwards except conformance.
+
+It also changed how disagreements surfaced. When the agent wanted a log line per routed event, it
+flagged the conflict with the log-flood rule and asked, instead of quietly doing it — which is the
+rules file working exactly as intended. Several hundred lines a second would have been a
+denial-of-service on my own log pipeline; the routing decision is now at `DEBUG`, and the per-route
+counters carry the same information at a rate a human can read.
 
 ### 5. Review the code, not the design
 
@@ -90,7 +112,11 @@ I did not take it on trust: I verified every claim against the code before chang
 
 ## What I would do differently
 
-**Write `CLAUDE.md` before the first line of code, not after the second correction.** Most of its invariants were extracted from mistakes rather than anticipated. The ones written up front are also the ones that held.
+**Anticipate more of the invariants instead of harvesting them from bugs.** The contract existed
+before the implementation, but two of its rules did not: `I2`'s definition of "the reader", and
+`I7`'s insistence that eviction be *wired* rather than merely written. Both were added after the
+defects they would have prevented, and both were foreseeable. The rules written up front are also
+the ones that held.
 
 **Run it earlier.** Three of the six defects in section 7 of the design needed the service running to surface, and one needed a clean-cluster deploy following my own README. I wrote a great deal of prose about behaviour under congestion before ever watching it behave.
 
