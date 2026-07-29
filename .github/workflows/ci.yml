@@ -1,3 +1,8 @@
+# CI runs the same commands the Makefile does, deliberately.
+#
+# A pipeline that reimplements the local checks drifts from them, and then the
+# green tick stops meaning "this is what I ran". `make lint` and `make race` are
+# the contract; this file just runs them somewhere else.
 name: ci
 
 on:
@@ -16,31 +21,28 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
         with:
-          python-version: "3.13"
-          cache: pip
+          # Matches the `go` directive in go.mod. The metrics client's
+          # dependency tree requires it; see the README.
+          go-version-file: go.mod
+          cache: true
 
-      - name: Install
-        run: |
-          pip install -r requirements-dev.txt
-          pip install pytest-timeout aws-cdk-lib constructs
-
+      # go vet, plus a gofmt check that fails rather than silently reformatting.
       - name: Lint
-        run: ruff check router tests
+        run: make lint
 
-      - name: Test
-        run: pytest -q --timeout=60
+      # -race across every package. D3 relies on a sharded mutex rather than
+      # single-goroutine ownership, so the guarantee needs verifying on every
+      # commit rather than being asserted in the design document.
+      - name: Test with the race detector
+        run: make race
 
-      - name: Build image
-        run: docker build -t jetstream-router:ci .
-
-      # Proves the serverless target is real IaC rather than a diagram. It is
-      # never deployed — synth alone is the check.
-      - name: Synthesize the AWS stack
-        working-directory: infra/cdk
-        run: npx --yes aws-cdk@2 synth --quiet
+      # The image is how this is actually reviewed, and the Dockerfile lives in
+      # deploy/ rather than the repo root — worth failing here if that changes.
+      - name: Build the container image
+        run: docker build -f deploy/Dockerfile -t jetstream-router:ci .
