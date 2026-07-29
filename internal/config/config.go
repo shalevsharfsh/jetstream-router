@@ -99,10 +99,10 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 // Default is what the service runs with when nothing is supplied, so the binary
 // is runnable with no setup.
 //
-// The per-route numbers are deliberately NOT uniform. Uniform values would be
-// less code and worse thinking: measured against the live firehose the routes
-// differ in volume by more than an order of magnitude, and they differ in what
-// a lost event costs.
+// The per-route numbers are deliberately NOT uniform, and the buffer sizes are
+// derived rather than chosen: a buffer is time, not space, and each is sized for
+// roughly 60 seconds of tolerance at twice its measured arrival rate. See
+// deploy/configmap.yaml for the table and DESIGN.md D1 for the reasoning.
 func Default() Config {
 	return Config{
 		Jetstream: Jetstream{
@@ -135,13 +135,13 @@ func Default() Config {
 		Routes: map[string]route.Config{
 			"content":      {Buffer: 4096, Workers: 4, Policy: route.PolicyDrop},
 			"engagement":   {Buffer: 32768, Workers: 8, Policy: route.PolicyDrop},
-			"social-graph": {Buffer: 4096, Workers: 2, Policy: route.PolicyDrop},
+			"social-graph": {Buffer: 2048, Workers: 2, Policy: route.PolicyDrop},
 			// Deletions are cleanup and compliance work: losing one is worse than
 			// delaying one, and the volume is low enough that congestion is
 			// implausible. This is the route the block policy exists for.
-			"retraction": {Buffer: 4096, Workers: 2, Policy: route.PolicyBlock,
+			"retraction": {Buffer: 2048, Workers: 2, Policy: route.PolicyBlock,
 				BlockTimeout: 2 * time.Second},
-			"default": {Buffer: 1024, Workers: 1, Policy: route.PolicyDrop},
+			"default": {Buffer: 2048, Workers: 1, Policy: route.PolicyDrop},
 		},
 		Keywords:  []string{"kubernetes", "security", "agent", "bluesky"},
 		Languages: []string{"en"},

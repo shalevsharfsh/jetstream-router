@@ -109,6 +109,28 @@ Sends into route channels are non-blocking; a full buffer drops the event and in
 blocking one route stalls *every* route — head-of-line blocking through the back door, with the
 slowest consumer dictating the throughput of the whole system.
 
+**A buffer is time, not space.** Size divided by arrival rate is how long that route can be
+completely stalled before it starts losing events, and that is the number worth choosing. Sized for
+about sixty seconds of tolerance at twice the measured mean rate:
+
+| Route | ev/s | Buffer | Stalled before loss |
+| --- | ---: | ---: | ---: |
+| engagement | 223 | 32,768 | 73s |
+| content | 39 | 4,096 | 53s |
+| social-graph | 17 | 2,048 | 60s |
+| retraction | 13 | 2,048 | 79s |
+| default | 13 | 2,048 | 79s |
+
+Both bounds are real. **Too small** and the route sheds on every ordinary burst, because traffic
+arrives in waves and the buffer exists for the peak rather than the mean. **Too large** and two
+worse things happen: events go stale — an alert derived from a ten-minute-old event is worth
+little, and in a detection context close to nothing — and *the failure hides*, because a route can
+be wedged for half an hour with its drop counter still reading zero. The drop counter is not only
+loss, it is the alarm.
+
+The first sizing gave 80 to 307 seconds — a 3.9× spread nobody had chosen. Deriving them from
+measurement narrowed it to 1.5× on slightly less memory.
+
 `block` exists as a per-route policy for the retraction path, where a lost deletion is worse than a
 delayed one and congestion is implausible — and even it carries a timeout, so one route can never
 hold the stream hostage.

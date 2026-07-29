@@ -8,9 +8,23 @@
 # before any collection rule regardless of where it appears in this list, because
 # a delete commit carries no record for a create-path handler to match against.
 #
-# The per-route numbers are deliberately NOT uniform. Measured against the live
-# firehose the routes differ in volume by more than an order of magnitude, and
-# they differ in what a lost event costs.
+# The per-route numbers are deliberately NOT uniform, and the buffers are not
+# guesses. A buffer is time, not space: size divided by arrival rate is how long
+# that route can be completely stalled before it starts losing events.
+#
+# Sized for roughly 60 seconds of tolerance at twice the measured mean rate,
+# from a 30-second sample of the live firehose:
+#
+#   route          ev/s   buffer   stalled-before-loss (at 2x)
+#   engagement      223    32768    73s
+#   content          39     4096    53s
+#   social-graph     17     2048    60s
+#   retraction       13     2048    79s
+#   default          13     2048    79s
+#
+# Sixty seconds is long enough to ride out a GC pause, a slow downstream, or a
+# dependency restarting, and short enough that nothing sitting in a buffer is
+# more than a minute stale. See DESIGN.md D1 for why both bounds matter.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,9 +61,9 @@ data:
       "routes": {
         "content":      { "buffer": 4096,  "workers": 4, "policy": "drop" },
         "engagement":   { "buffer": 32768, "workers": 8, "policy": "drop" },
-        "social-graph": { "buffer": 4096,  "workers": 2, "policy": "drop" },
-        "retraction":   { "buffer": 4096,  "workers": 2, "policy": "block", "block_timeout": "2s" },
-        "default":      { "buffer": 1024,  "workers": 1, "policy": "drop" }
+        "social-graph": { "buffer": 2048,  "workers": 2, "policy": "drop" },
+        "retraction":   { "buffer": 2048,  "workers": 2, "policy": "block", "block_timeout": "2s" },
+        "default":      { "buffer": 2048,  "workers": 1, "policy": "drop" }
       },
       "keywords":  ["kubernetes", "security", "agent", "bluesky"],
       "languages": ["en"],
