@@ -320,7 +320,7 @@ backpressure, retries and DLQs come off the shelf. The cost is vendor lock-in an
 over batching and shedding behaviour — for a service whose entire value is how it handles
 congestion, that control is worth keeping until scale justifies giving it up.
 
-## 6. Delivery plan
+## 6. Scope and tests
 
 Built in the order that keeps a working pipeline at every step: skeleton with config, structured
 logging and graceful shutdown; then ingestor, classifier, router and a single route wired end to
@@ -332,8 +332,6 @@ Built to the boundary of the timebox and no further. **Deliberately described ra
 the broker swap, external state, per-route dead-letter queues that outlive the process, sharded
 multi-connection ingest, and replay tooling. The dispatch interface is the seam each of those
 attaches to, and it is narrow on purpose.
-
-## 7. Test plan
 
 A small number of tests aimed at the logic that carries the design, rather than broad coverage.
 
@@ -350,6 +348,68 @@ Deliberately not covered: the live Jetstream connection (non-deterministic, and 
 rather than a logic test), and load testing (worth doing, out of timebox). Manual verification is a
 kind deploy with logs tailed for a few minutes against the real firehose — which is how the
 measurements in §1 and two of the bugs noted in `AI.md` were found.
+
+---
+
+## 7. Defects the design did not prevent
+
+Six defects reached working code. Three were caught by deploying the service and watching it; three
+by a later review that read the code closely. **The design document caught none of them** — and it
+explicitly forbade the worst one.
+
+### Found by reading the code
+
+**The reader decoded the record body — the exact thing D1 forbids.** Selecting a per-worker queue
+required a shard key, and for the stateful routes that key lives inside `commit.record`. So the
+enqueue path called into the handler to extract it, which meant a full `json.Unmarshal` of every
+like and repost *on the single ingest goroutine* — the busiest route's parse, on the one goroutine
+whose stall halts the stream, on attacker-controlled nested content, and then decoded a second time
+in the handler.
+
+D1 states this prohibition in its own words. The rules file states it as an invariant. Both were
+written before the code, and the code broke it anyway, because "the reader" was read as "the read
+loop" rather than "everything up to the enqueue". The fix moved partitioning into the worker and
+pays a sharded mutex for it (D3); the rules file now defines the boundary explicitly, and
+`TestRecordIsDecodedOnlyByTheWorker` pins it.
+
+**A TTL sweep that nothing called.** `Window.Sweep` existed, was documented as running on a timer,
+and had exactly one caller: its own test. The size cap was holding the line alone, so half of the
+bounded-state invariant was decorative — a key that appeared once and vanished kept its entry until
+LRU pressure evicted it. Writing the eviction is not the same as wiring it.
+
+**A backoff counter that never reset.** The reconnect attempt counter only ever climbed. Six brief
+disconnects across a week leave the process pinned at the maximum delay indefinitely, so a
+disconnect after eight hours of perfect uptime waits the full backoff before even trying.
+
+### Found by running it
+
+**A log-flood vector the security section did not prevent.** The `default` route logs unknown
+collections as a bounded bucket — but the throttle was keyed on the *raw collection*, which is
+attacker-supplied. Every novel lexicon therefore earned its own log line: precisely the flood the
+throttle existed to prevent, hundreds a minute. Section 4 already required metric labels to be
+bounded; it did not say the same about throttle keys, so the rule was extended to **anything keyed
+on an attacker-supplied value**.
+
+**Configuration that could not load.** `block_timeout: "2s"` in the ConfigMap cannot unmarshal into
+a `time.Duration`, and the pod crash-looped on first deploy. The failure was clean and immediate
+because configuration is validated at startup rather than lazily — which is the argument for
+validating it there.
+
+**A test that passed for the wrong reason.** In the isolation-under-congestion test, the *healthy*
+control route was itself under-buffered and shedding. The test still passed, because the assertion
+was weak enough not to notice. It now fails loudly if the control route sheds at all — a test that
+cannot distinguish success from a different failure is not evidence.
+
+### The pattern worth keeping
+
+Every one of these was written in the same confident register as the code that was correct. Three
+needed the service running to surface; three needed someone reading the code against the document
+rather than reading the document alone. Neither kind was going to be found by reviewing the design.
+
+That is the argument for treating this document as **a claim to be checked, not a record of what is
+true.**
+
+---
 
 ## 8. Known gaps
 
