@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/shalevsharfsh/jetstream-router/internal/event"
 	"github.com/shalevsharfsh/jetstream-router/internal/obs"
 )
 
@@ -96,35 +95,4 @@ func lower(ss []string) []string {
 
 func evictCounter(route string) func(string) {
 	return func(reason string) { obs.StateEvicted.WithLabelValues(route, reason).Inc() }
-}
-
-// dedupGate is the shared idempotency check for the stateful routes (I8).
-//
-// The cursor advancing on enqueue plus the reconnect rewind guarantees
-// duplicates even in single-process operation, before any scaling is involved.
-type dedupGate struct {
-	route string
-	seen  []*Dedup // one per shard, owned by that shard's goroutine
-}
-
-func newDedupGate(route string, shards int, l Limits) *dedupGate {
-	if shards < 1 {
-		shards = 1
-	}
-	g := &dedupGate{route: route, seen: make([]*Dedup, shards)}
-	for i := range g.seen {
-		g.seen[i] = NewDedup(l.DedupUS, l.MaxKeysPerShard, evictCounter(route))
-	}
-	return g
-}
-
-func (g *dedupGate) duplicate(shard int, ev event.Event) bool {
-	if shard >= len(g.seen) || shard < 0 {
-		shard = 0
-	}
-	if g.seen[shard].Seen(ev.DedupKey(), ev.TimeUS) {
-		obs.Duplicates.WithLabelValues(g.route).Inc()
-		return true
-	}
-	return false
 }

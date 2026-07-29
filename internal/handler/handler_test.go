@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/shalevsharfsh/jetstream-router/internal/event"
@@ -133,7 +134,7 @@ func TestContentNeverEmitsRecordText(t *testing.T) {
 
 func TestEngagementAlertsOnceAtTheThreshold(t *testing.T) {
 	sink := &capture{}
-	h := NewEngagement(sink, 1, 5, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
+	h := NewEngagement(sink, 4, 5, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
 	uri := "at://did:plc:x/app.bsky.feed.post/hot"
 
 	base := int64(1_000_000_000)
@@ -160,7 +161,7 @@ func TestEngagementAlertsOnceAtTheThreshold(t *testing.T) {
 
 func TestEngagementCountsPerTargetNotGlobally(t *testing.T) {
 	sink := &capture{}
-	h := NewEngagement(sink, 1, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
+	h := NewEngagement(sink, 4, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
 	base := int64(1_000_000_000)
 
 	for i := 0; i < 6; i++ {
@@ -175,7 +176,7 @@ func TestEngagementCountsPerTargetNotGlobally(t *testing.T) {
 // D7 in practice: the reconnect overlap must not double-count.
 func TestEngagementSuppressesReplayedDuplicates(t *testing.T) {
 	sink := &capture{}
-	h := NewEngagement(sink, 1, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
+	h := NewEngagement(sink, 4, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
 	uri := "at://did:plc:x/app.bsky.feed.post/a"
 	base := int64(1_000_000_000)
 
@@ -202,7 +203,7 @@ func TestEngagementSuppressesReplayedDuplicates(t *testing.T) {
 
 func TestFollowBurstKeysOnTheFolloweeNotTheFollower(t *testing.T) {
 	sink := &capture{}
-	h := NewSocialGraph(sink, 1, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
+	h := NewSocialGraph(sink, 4, 3, 60*sec, Limits{MaxKeysPerShard: 1000, DedupUS: 120 * sec})
 	base := int64(1_000_000_000)
 
 	for i := 0; i < 3; i++ {
@@ -269,5 +270,58 @@ func mkEvent(collection, op, did, rkey string, record map[string]any, timeUS int
 		RKey:   rkey,
 		TimeUS: timeUS,
 		Record: raw,
+	}
+}
+
+// The state is sharded and mutated under a lock rather than owned by a single
+// goroutine (see shardSet). That is only safe if concurrent workers touching
+// the same key still produce one consistent count — which is what D3 actually
+// promises. Run under -race.
+func TestConcurrentWorkersOnOneKeyStayConsistent(t *testing.T) {
+	sink := &capture{}
+	h := NewEngagement(sink, 8, 50, 60*sec, Limits{MaxKeysPerShard: 5000, DedupUS: 120 * sec})
+	uri := "at://did:plc:x/app.bsky.feed.post/hot"
+	base := int64(1_000_000_000)
+
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				// Distinct actors so the dedup gate does not suppress them.
+				ev := like(uri, fmt.Sprintf("did:plc:a%d-%d", w, i), base+int64(w*100+i))
+				_ = h.Handle(context.Background(), w, ev)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// 800 distinct likes of one post, threshold 50, throttled to one alert per
+	// window: exactly one alert, no double-counting, no lost updates.
+	if got := sink.count("threshold crossed"); got != 1 {
+		t.Errorf("alerts = %d, want exactly 1 across 8 concurrent workers", got)
+	}
+}
+
+// I7 promises a size cap AND a TTL. A review found the TTL sweep was defined
+// but never called outside tests, so only the size cap was live.
+func TestTTLSweepRunsWithoutExternalTimer(t *testing.T) {
+	h := NewEngagement(&capture{}, 1, 1_000_000, 60*sec,
+		Limits{MaxKeysPerShard: 1_000_000, DedupUS: 1 * sec})
+	base := int64(1_000_000_000)
+
+	// Well past sweepEvery distinct one-shot keys, each far outside the window
+	// of the last. With no sweep these all persist until LRU pressure, which
+	// with a million-key cap never arrives.
+	for i := 0; i < sweepEvery*2; i++ {
+		uri := fmt.Sprintf("at://did:plc:x/app.bsky.feed.post/%d", i)
+		_ = h.Handle(context.Background(), 0, like(uri, "did:plc:a", base+int64(i)*120*sec))
+	}
+
+	live := h.state.shards[0].window.Len()
+	if live >= sweepEvery {
+		t.Errorf("window holds %d keys after %d one-shot events; TTL sweep is not running",
+			live, sweepEvery*2)
 	}
 }

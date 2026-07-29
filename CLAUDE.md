@@ -29,6 +29,13 @@ Unmarshal the envelope (`kind`, `commit.collection`, `commit.operation`, `did`, 
 `commit.rkey`). Leave `commit.record` as `json.RawMessage`. Handlers parse their own record
 inside their own worker. Never fully decode a record on the shared reader goroutine.
 
+**"The reader" means everything up to and including the enqueue**, not just the read loop —
+`Offer()` and anything it calls run on that goroutine. A partitioning scheme that needs a key
+from inside the record is therefore banned at enqueue time and belongs in the worker. This
+loophole was live once: shard selection called into the handler to hash `subject.uri`, which
+put the busiest route's full `json.Unmarshal` on the reader. Pinned by test in
+`route_test.go:TestRecordIsDecodedOnlyByTheWorker`.
+
 **I3 — Delete is matched before the collection map.**
 `operation == delete` routes to retraction regardless of collection. A delete commit carries
 no record, so create-path handlers have nothing to match against. Routing reads
@@ -52,7 +59,8 @@ burst.
 **I7 — Every map is bounded.**
 Counters, windows and the dedup set are capped by size and TTL. An unbounded map keyed on
 anything attacker-supplied is a memory-exhaustion vector. If you add state, add its bound in
-the same change.
+the same change — and **wire the eviction, not just write it**. A TTL sweep that nothing calls
+leaves only the size cap live, which is half the invariant.
 
 **I8 — Idempotency key is `did + collection + rkey + operation`.**
 `rkey` is unique only within its collection. Do not shorten this key.

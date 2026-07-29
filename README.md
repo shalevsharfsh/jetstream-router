@@ -9,9 +9,11 @@ The reasoning behind the design — the options weighed, the decisions and their
 
 ## Requirements
 
-- Go 1.22+
 - Docker
 - [kind](https://kind.sigs.k8s.io/) and `kubectl`
+- Go 1.25+ **only if you want to build or test outside Docker**. The metrics client pulls a
+  dependency tree that requires it; the container build uses `golang:1.25-alpine`, so
+  `make deploy` works on any machine with Docker regardless of the local toolchain.
 
 Nothing else. The service needs no credentials: Jetstream is a public, unauthenticated endpoint.
 

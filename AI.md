@@ -127,6 +127,38 @@ work. It found real inconsistencies I had missed:
   well past the requested length. Cutting it back was my call, not the agent's — it will keep
   adding as long as you keep asking.
 
+## A fourth review pass, after the code existed
+
+I ran one more review once there was something to read, and it was the most productive of the
+four. It found an invariant violation I had written the invariant for:
+
+- **`I2` was violated by the sharding.** Selecting a per-worker queue required a key from inside
+  `commit.record`, so `Offer()` — which runs on the ingest goroutine — was doing a full
+  `json.Unmarshal` of every like and repost. The busiest route's parse, on the one goroutine whose
+  stall halts the stream, on attacker-controlled nested content, and then decoded again in the
+  handler. The document and the rules file both forbade exactly this.
+
+  The fix moved partitioning into the worker and pays a sharded mutex for it. D3 loses its
+  "no locks" property; I2 keeps the thing that actually matters. `CLAUDE.md` now spells out that
+  "the reader" includes the enqueue path, because that is the loophole the bug walked through.
+
+- **A TTL sweep that nothing called.** `Window.Sweep` existed, was documented as running on a
+  timer, and had exactly one caller: its own test. The size cap was holding the line alone, so
+  half of `I7` was decorative.
+
+- **A backoff counter that never reset.** Six brief disconnects across a week left the process
+  pinned at the maximum delay forever.
+
+- **A claim in the design that the code had outgrown** — the doc said a hot key drops events for
+  every subject on its route, but per-worker queues meant the blast radius was one shard. Fixing
+  the sharding made the doc's original claim true again, which is a coincidence I would rather
+  have arrived at deliberately.
+
+The lesson is the same one the rest of this file keeps arriving at, sharpened: an agent will
+write the invariant, cite the invariant, and then violate the invariant three files away, all in
+the same confident register. Reviews that read the code find these. Reviews that read the design
+do not.
+
 ## What I would do differently
 
 `FILL — one or two honest lines. Something like: I would have written CLAUDE.md before the first

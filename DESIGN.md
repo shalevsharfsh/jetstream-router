@@ -158,13 +158,26 @@ position. So shedding is **irreversible, not deferred**. The alternative is hold
 on the route that is already overloaded, which stalls the stream to protect the very events it
 cannot keep up with. `events_dropped_total` is the only record that a dropped event ever existed.
 
-**D3 — Aggregation state is owned by exactly one goroutine per route.** Rolling counters live in a
-plain map owned by a single worker, so there are no mutexes and no races. Where a stateful route
-needs a pool larger than one, events are sharded by `hash(subjectKey) % N` so each key has exactly
-one owner. The trade-off is hot keys: a viral post pins one worker — and because the buffer is
-per-route rather than per-shard, a sufficiently hot key can push that whole route into shedding for
-every subject on it. The production answer is an external store with atomic increments, which
-removes the need to shard at all.
+**D3 — A key is mutated by one thing at a time.** Rolling counters are partitioned by
+`hash(subjectKey) % N` across shards, and a worker takes that shard's lock for the read-modify-write.
+
+The first implementation had no locks at all: each worker owned a queue, and events were hashed to
+a worker *before* being enqueued. That is a nicer property, and it was wrong — the hash key for
+these routes lives inside `commit.record`, so selecting the queue meant decoding the record body on
+the single ingest goroutine. It violated the reader's decode budget, put the heaviest route's JSON
+parse on the one goroutine whose stall halts everything, exposed that goroutine to
+attacker-controlled nested content, and decoded every record twice. A reviewer caught it; a test now
+pins it.
+
+So the partition moved into the worker, which decodes on its own goroutine and then locks. The
+guarantee is unchanged — one mutator per key at a time — and the cost is a mutex. That is the right
+way round: an uncontended lock is nanoseconds, while work on the shared reader is charged against
+the throughput of the entire stream.
+
+The remaining trade-off is hot keys. A viral post serialises behind one shard's lock, and because
+the buffer is per-route, sustained pressure on one key can push the whole route into shedding. The
+production answer is an external store with atomic increments, which removes the partitioning
+problem entirely.
 
 Windows are evaluated on **event time** (`time_us`), not wall clock. After a reconnect the service
 replays events that are already minutes old; a wall-clock window would read that replay as a burst
@@ -172,7 +185,10 @@ of simultaneous activity and fire a false alert on the exact path that recovery 
 
 State is bounded like the buffers are: counter, window and dedup maps are capped by size and TTL.
 An unbounded map keyed on an attacker-supplied subject is a memory-exhaustion vector, and capping
-it is the same principle already applied to the channels — see §4.
+it is the same principle already applied to the channels — see §4. The TTL sweep runs on a fixed
+event count inside the shard that owns the map, not on a timer: a timer goroutine would contend for
+the same lock and buy nothing. (A review found the sweep defined but never called, which left only
+the size cap live; there is now a test that fails if it stops running.)
 
 **D4 — Unknown types are routed, not silently discarded.** An unmatched key goes to the default
 route, which counts it and logs a bounded bucket. New lexicons appear on the network continuously —
@@ -341,7 +357,10 @@ Things I know are missing, rather than things I hope nobody notices.
 
 - **Isolation is between routes, not within one.** One process, one heap, one GC. D6 contains the
   worst case; a broker is the real fix.
-- **A hot key degrades its whole route,** because the buffer is per-route and not per-shard.
+- **A hot key degrades its whole route,** because the buffer is per-route and not per-shard, and
+  because that key's updates serialise on one shard lock.
+- **D3 costs a mutex.** Lock-free single-goroutine ownership would be nicer, but achieving it
+  required decoding the record on the reader — a worse trade. Stated here rather than buried.
 - **Nothing handles an event type needing state from two routes at once.** Pure fan-out has no
   answer for it: either that state moves to an external store both routes read, weakening the
   no-shared-resource property, or an explicit join stage is added downstream of both.

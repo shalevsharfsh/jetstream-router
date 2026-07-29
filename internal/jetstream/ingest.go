@@ -29,6 +29,10 @@ import (
 	"github.com/shalevsharfsh/jetstream-router/internal/obs"
 )
 
+// healthyFor is how long a connection must hold before the reconnect backoff
+// is considered to have served its purpose and resets.
+const healthyFor = time.Minute
+
 // State is the connection lifecycle. Keeping cursor handling, backoff and
 // replay detection in one explicit state machine is considerably clearer than
 // scattering booleans through the read loop (D5).
@@ -159,9 +163,20 @@ func (in *Ingestor) Run(ctx context.Context) {
 			in.setState(StateReconnecting)
 		}
 
+		connectedAt := time.Now()
 		err := in.connectAndRead(ctx)
 		if ctx.Err() != nil {
 			break
+		}
+
+		// A connection that held for a meaningful stretch is evidence the
+		// upstream is healthy, so the next failure starts backing off from
+		// scratch. Without this the counter only ever climbs: six brief blips
+		// over a week leave the process pinned at the maximum delay, and a
+		// seventh disconnect after eight flawless hours waits the full
+		// backoff before even trying.
+		if time.Since(connectedAt) > healthyFor {
+			attempt = 0
 		}
 
 		attempt++
@@ -290,11 +305,4 @@ func errString(err error) string {
 		s = s[:200]
 	}
 	return strings.ToValidUTF8(s, "")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

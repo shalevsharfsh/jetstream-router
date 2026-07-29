@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,54 +194,50 @@ func TestBlockPolicyWaitsThenGivesUp(t *testing.T) {
 	}
 }
 
-// A sharded handler must see each key on exactly one worker, which is what lets
-// it own state with no mutex.
-func TestShardingGivesEachKeyOneOwner(t *testing.T) {
+// I2, pinned by test after a review found it violated.
+//
+// Offer() runs on the ingest goroutine. If anything on that path touches
+// ev.Record, the heaviest route's JSON parse lands on the one goroutine whose
+// stall halts the entire stream — and parses attacker-controlled, arbitrarily
+// nested content there too. An earlier design selected a per-worker queue by
+// hashing a key from inside the record, which did exactly that.
+//
+// The record is handed through untouched and is decoded only by the worker.
+func TestRecordIsDecodedOnlyByTheWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var mu sync.Mutex
-	owners := map[string]map[int]bool{}
+	body := []byte(`{"subject":{"uri":"at://did:plc:x/app.bsky.feed.post/a"},"pad":"` +
+		strings.Repeat("x", 4096) + `"}`)
 
-	h := &shardedHandler{fn: func(shard int, e event.Event) {
-		mu.Lock()
-		defer mu.Unlock()
-		if owners[e.DID] == nil {
-			owners[e.DID] = map[int]bool{}
-		}
-		owners[e.DID][shard] = true
-	}}
-
-	r := New(Config{Name: "sharded", Buffer: 256, Workers: 4, Policy: PolicyDrop}, h, quietLog())
+	seen := make(chan []byte, 1)
+	r := New(Config{Name: "i2", Buffer: 8, Workers: 4, Policy: PolicyDrop},
+		HandlerFunc(func(_ context.Context, _ int, e event.Event) error {
+			seen <- e.Record
+			return nil
+		}), quietLog())
 	r.Start(ctx)
 
-	keys := []string{"did:plc:a", "did:plc:b", "did:plc:c", "did:plc:d", "did:plc:e"}
-	for i := 0; i < 400; i++ {
-		r.Offer(ctx, ev(keys[i%len(keys)]))
+	e := ev("did:plc:a")
+	e.Record = body
+	if !r.Offer(ctx, e) {
+		t.Fatal("offer rejected")
 	}
-	time.Sleep(300 * time.Millisecond)
 
-	mu.Lock()
-	defer mu.Unlock()
-	for key, shards := range owners {
-		if len(shards) != 1 {
-			t.Errorf("key %s was handled by %d shards, want exactly 1", key, len(shards))
+	select {
+	case got := <-seen:
+		if string(got) != string(body) {
+			t.Error("record was altered before reaching the worker")
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker never received the event")
 	}
-	if len(owners) != len(keys) {
-		t.Errorf("saw %d keys, want %d", len(owners), len(keys))
-	}
-}
 
-type shardedHandler struct {
-	fn func(shard int, e event.Event)
+	// The structural half of the guarantee: Route holds no handler-supplied key
+	// extractor, so there is nothing on the Offer path that could decode. If a
+	// future change reintroduces one, this comment is the place it will be
+	// argued about — and I2 says it needs arguing.
 }
-
-func (h *shardedHandler) Handle(_ context.Context, shard int, e event.Event) error {
-	h.fn(shard, e)
-	return nil
-}
-func (h *shardedHandler) ShardKey(e event.Event) string { return e.DID }
 
 // Drain must finish in-flight work rather than dropping it, so a rolling deploy
 // is invisible downstream.

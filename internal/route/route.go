@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -69,14 +68,6 @@ type HandlerFunc func(ctx context.Context, shard int, ev event.Event) error
 
 func (f HandlerFunc) Handle(ctx context.Context, shard int, ev event.Event) error {
 	return f(ctx, shard, ev)
-}
-
-// Sharded is implemented by handlers whose state is owned per worker. When a
-// handler is sharded, events are dispatched by hash(key)%N so each key has
-// exactly one owner and the handler needs no mutex (D3).
-type Sharded interface {
-	// ShardKey returns the value to partition on, or "" to use any worker.
-	ShardKey(ev event.Event) string
 }
 
 // Config is one route's tuning. Everything an operator might want to change
@@ -153,13 +144,18 @@ func (c Config) withDefaults() Config {
 type Route struct {
 	cfg     Config
 	handler Handler
-	sharded Sharded
 	log     *slog.Logger
 
-	// One channel per worker when the handler is sharded, so a key always
-	// reaches the same goroutine. A single shared channel otherwise.
-	queues []chan event.Event
-	wg     sync.WaitGroup
+	// One bounded channel for the route, drained by every worker in its pool.
+	//
+	// Sharding deliberately does NOT happen here. Selecting a per-worker queue
+	// would require the shard key, and for the stateful routes that key lives
+	// inside commit.record — so computing it here would decode the record body
+	// on the single ingest goroutine, which is exactly what I2 forbids and what
+	// D1 opens by objecting to. Handlers shard their own state instead, after
+	// decoding on their own goroutine. See handler.shardSet.
+	queue chan event.Event
+	wg    sync.WaitGroup
 }
 
 // New builds a route. It does not start the workers; call Start.
@@ -170,53 +166,16 @@ func New(cfg Config, h Handler, log *slog.Logger) *Route {
 		cfg:     cfg,
 		handler: h,
 		log:     log.With("route", cfg.Name),
+		queue:   make(chan event.Event, cfg.Buffer),
 	}
-	if s, ok := h.(Sharded); ok && cfg.Workers > 1 {
-		r.sharded = s
-	}
-
-	// A sharded route splits its buffer across per-worker queues so the
-	// configured total is what actually exists in memory.
-	n := 1
-	if r.sharded != nil {
-		n = cfg.Workers
-	}
-	per := cfg.Buffer / n
-	if per < 1 {
-		per = 1
-	}
-	r.queues = make([]chan event.Event, n)
-	for i := range r.queues {
-		r.queues[i] = make(chan event.Event, per)
-	}
-
-	obs.QueueCapacity.WithLabelValues(cfg.Name).Set(float64(per * n))
+	obs.QueueCapacity.WithLabelValues(cfg.Name).Set(float64(cfg.Buffer))
 	return r
 }
 
 func (r *Route) Name() string { return r.cfg.Name }
 
-// Depth is the total number of events currently buffered.
-func (r *Route) Depth() int {
-	n := 0
-	for _, q := range r.queues {
-		n += len(q)
-	}
-	return n
-}
-
-func (r *Route) queueFor(ev event.Event) chan event.Event {
-	if r.sharded == nil {
-		return r.queues[0]
-	}
-	key := r.sharded.ShardKey(ev)
-	if key == "" {
-		return r.queues[0]
-	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return r.queues[int(h.Sum32())%len(r.queues)]
-}
+// Depth is the number of events currently buffered.
+func (r *Route) Depth() int { return len(r.queue) }
 
 // Offer hands an event to the route and reports whether it was accepted.
 //
@@ -230,7 +189,7 @@ func (r *Route) queueFor(ev event.Event) chan event.Event {
 // (D2), so a dropped event is never replayed and the counter is the only record
 // that it existed.
 func (r *Route) Offer(ctx context.Context, ev event.Event) bool {
-	q := r.queueFor(ev)
+	q := r.queue
 
 	if r.cfg.Policy == PolicyBlock {
 		start := time.Now()
@@ -267,18 +226,13 @@ func (r *Route) Offer(ctx context.Context, ev event.Event) bool {
 // Start launches the worker pool.
 func (r *Route) Start(ctx context.Context) {
 	for i := 0; i < r.cfg.Workers; i++ {
-		q := r.queues[0]
-		if r.sharded != nil {
-			q = r.queues[i]
-		}
 		r.wg.Add(1)
-		go r.worker(ctx, i, q)
+		go r.worker(ctx, i, r.queue)
 	}
 	r.log.Info("route started",
 		"workers", r.cfg.Workers,
 		"buffer", r.cfg.Buffer,
-		"policy", string(r.cfg.Policy),
-		"sharded", r.sharded != nil)
+		"policy", string(r.cfg.Policy))
 }
 
 func (r *Route) worker(ctx context.Context, shard int, q chan event.Event) {
@@ -363,9 +317,7 @@ func (r *Route) callHandler(ctx context.Context, shard int, ev event.Event) (err
 // ordering matters on SIGTERM: stop reading, drain, then commit the cursor —
 // which leaves a bounded replay overlap rather than a gap.
 func (r *Route) Drain(timeout time.Duration) {
-	for _, q := range r.queues {
-		close(q)
-	}
+	close(r.queue)
 	done := make(chan struct{})
 	go func() { r.wg.Wait(); close(done) }()
 
