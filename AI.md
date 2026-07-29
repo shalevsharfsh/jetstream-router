@@ -34,8 +34,9 @@ I also wrote the out-of-scope list into the rules file. Left alone, agents build
 
 ## Prompts that did the real work
 
-Condensed — the originals were longer and more conversational — but each carries the instruction
-that was actually given, and the outcome described after it is what came back.
+Prompts 1, 2, 3 and 5 are condensed — the originals were longer and more conversational — but each
+carries the instruction that was actually given, and the outcome described after it is what came
+back. Prompt 4 is reproduced in full, because its length is the point.
 
 ### 1. Sample the wire before writing the classifier
 
@@ -62,28 +63,108 @@ Constraining it to *read and report* rather than *read and fix* was the point. A
 
 ### 4. Implementation, against a contract I wrote first
 
-Before any code, I turned the settled design into two files: `README.md` — how the service runs,
-what is configurable, what the log output looks like — and `CLAUDE.md`, which restates each design
-decision as an invariant with its reason attached. Then:
+Before any code, I turned the settled design into two files: `DESIGN.md` — the reasoning, the
+options weighed, the decisions and their costs — and `CLAUDE.md`, which restates each of those
+decisions as an invariant with the reason attached. The implementation prompt is given in full
+because the contract is the interesting part, not the instruction:
 
-> The design is settled and both files are in the repo. Build the service against them.
->
-> Where they are specific — the package layout, the config schema, the metric names, the log
-> messages, the deployment shape — follow them exactly. Those are deliberate choices, not
-> suggestions, so do not improve on them. Where they are ambiguous or contradict each other, stop
-> and ask rather than picking a reading. If you think one of the invariants is wrong, tell me which
-> and why before you write any code.
+```
+Context: DESIGN.md and CLAUDE.md are in the repo root. Read both before anything else.
 
-Writing the contract first is the part that mattered; the prompt is thin because it can be. Every
-decision an agent would otherwise invent plausibly and wrongly — where packages live, what the
-metrics are called, whether the ingest deployment is a `Deployment` or a `StatefulSet` — was
-already made, so there was nothing to negotiate and nothing to review afterwards except conformance.
+The design is settled and both files are authoritative. Where they are specific —
+the package layout, the config schema, the metric and label names, the log messages,
+the routing precedence, the deployment shape — follow them exactly. Those are
+deliberate choices with reasoning attached, not defaults I reached for. Do not
+improve on them, rename them, or reorganise them. If the code and the document
+disagree after you are done, that is a defect regardless of which one is nicer.
 
-It also changed how disagreements surfaced. When the agent wanted a log line per routed event, it
-flagged the conflict with the log-flood rule and asked, instead of quietly doing it — which is the
-rules file working exactly as intended. Several hundred lines a second would have been a
-denial-of-service on my own log pipeline; the routing decision is now at `DEBUG`, and the per-route
-counters carry the same information at a rate a human can read.
+Where the two documents are ambiguous or contradict each other, stop and ask rather
+than picking a reading. A quiet choice between two plausible interpretations is
+worse than a question, because I will not know it was made.
+
+BEFORE YOU WRITE ANY CODE
+
+Do not start with the skeleton. Start with two lists:
+
+1. Anything in the design you expect to be genuinely hard to satisfy, and why.
+
+2. Any invariant in CLAUDE.md that the most natural implementation of some other
+   part of the design would violate as a side effect. Not "where might I forget
+   to follow a rule" — where do two correct-looking decisions collide.
+
+The second list is the one I actually care about. The failure mode I am worried
+about is not you ignoring the design; it is you following two parts of it faithfully
+and breaking a third in the gap between them. I9 says unknown types are routed, D3
+says state has a single owner per key, I2 says the reader decodes only the routing
+tuple — walk the interactions, not the items.
+
+Then propose the build order and the seams you will build against, and wait for me
+to confirm before creating files.
+
+WHILE YOU WORK
+
+- Smallest change that satisfies the request. No opportunistic refactoring of
+  adjacent code, no renaming things you did not need to touch.
+- If a request conflicts with an invariant, name the invariant and the conflict
+  before writing anything. Do not pick one silently and do not write a comment
+  explaining why you deviated.
+- The classifier and the router stay pure functions: an event in, a routing key or
+  a route name out. No I/O, no state, no logging inside them. That property is what
+  makes the routing table exhaustively testable, so it is load-bearing rather than
+  stylistic.
+- Standard library first. The only dependencies I expect are a WebSocket client and
+  a metrics client. A third one is a conversation, not a decision.
+- Every map you add gets its bound in the same change. If you cannot state the bound,
+  you do not understand the structure well enough to add it yet.
+- Nothing derived from event content reaches a log line or a metric label. Log
+  structure and derived values only — length, language code, matched or not. Metric
+  labels come from the fixed route set.
+
+TESTS
+
+Write the router table test and the isolation-under-congestion test first, before
+the implementation they cover. Those two carry the design; the rest of the suite is
+support. No mocking frameworks, hand-written fakes, and do not chase coverage — a
+test that passes without proving anything is worse than no test, so make each one
+fail for the right reason first.
+
+SCOPE
+
+The out-of-scope list in CLAUDE.md is a hard boundary, not a backlog. If a change
+starts pulling in the broker, a persistent DLQ, external state, or multi-connection
+sharding, stop and say so. Those are described in DESIGN.md deliberately. "Knowing
+where to stop" is part of what is being assessed here, so scope creep is a defect
+and not enthusiasm.
+
+DONE MEANS
+
+- go vet ./... clean, go test -race ./... green.
+- No new dependency without a stated reason.
+- Every claim DESIGN.md makes about behaviour is either true in the code or flagged
+  by you as now stale.
+- You can point at the line that satisfies each invariant. If you cannot, say which
+  one and we will look at it together.
+
+Start with the two lists.
+```
+
+**The second list is the whole point.** An agent asked "will you follow these rules" says yes and
+means it. The interesting failure is not disobedience — it is two rules that are individually
+satisfiable and jointly are not, where following both faithfully breaks a third in the gap between
+them. Asking for that analysis *before* the skeleton exists is cheap; asking for it afterwards
+means asking someone to argue against code they have already written.
+
+**It also did not work, and that is the useful part.** The collision the prompt names as an example
+— D3 wanting a single owner per key, I2 keeping the record body away from the reader — is precisely
+the pair that turned out to be violated. The shard key lives inside `commit.record`, so partitioning
+before the enqueue meant decoding on the ingest goroutine. The prompt pointed directly at it,
+produced an analysis, and the analysis did not catch it.
+
+That is not an argument against the prompt; it is the argument for everything downstream of it. A
+pre-implementation interaction review narrows the space but does not close it, which is why the
+definition of done asks the agent to *point at the line* satisfying each invariant rather than
+confirm that it did, and why the code review in prompt 5 existed at all. Section 7 of the design is
+what those two caught between them.
 
 ### 5. Review the code, not the design
 
@@ -139,9 +220,10 @@ the instruction I actually gave was missing four things, and each one maps to a 
   to be a separate named step with its own output.
 
 The broader lesson is that the prompt was not the bottleneck — the missing contract was. Once
-`README.md` and `CLAUDE.md` existed, the implementation instruction could be one line and still
-land, because every decision the agent would otherwise invent had already been made. A thin prompt
-over a thick contract beats a thick prompt over nothing.
+`DESIGN.md` and `CLAUDE.md` existed, most of the instruction's length went on *how to look for
+trouble* rather than on what to build — because everything the agent would otherwise invent had
+already been decided. A thin specification makes for a long prompt; a thick one makes the prompt
+almost entirely about verification.
 
 ## An honest summary
 
