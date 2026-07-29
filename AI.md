@@ -2,177 +2,104 @@
 
 How I used AI agents on this exercise, and where I did not take their output.
 
-> **Before submitting:** the items marked `FILL` need your own answer — they describe your setup
-> and your prompts, which only you can report honestly. Everything else in this file records
-> something that actually happened and is checkable against the repo or its history. Delete this
-> block when you are done.
-
 ## Setup
 
 | | |
 | --- | --- |
-| **Editor** | `FILL` — e.g. Cursor, with Claude Code running in the integrated terminal |
-| **Models** | `FILL` — which model for which kind of work |
-| **Rules file** | `CLAUDE.md`, checked into the repo root |
-| **MCP servers** | `FILL` — Atlassian (drafting the design in Confluence) and Lucid (architecture diagram) were used for the write-up; add or remove |
-| **Other** | `FILL` — subagents, skills, anything else that shaped output |
+| **Tool** | Claude Code, in the terminal, against this repo |
+| **Model** | Claude Opus 5 throughout — design conversation, implementation, and the review passes |
+| **Rules file** | `CLAUDE.md`, checked into the repo root. The single most useful piece of configuration here; see below |
+| **MCP servers** | **Atlassian** — the design was drafted in and still lives in Confluence, and the agent reads and edits that page directly rather than me copying prose between two places. **Lucid** — the architecture diagram in section 3 |
+| **Sub-agents** | Two: one to research the problem domain and prior art before any design work, and one read-only agent to map an existing codebase whose conventions I wanted to reuse |
+| **Verification** | `go vet`, `go test -race`, a `kind` deploy, and the live firehose. Nothing here is claimed working because the model said so |
 
-I split the work deliberately: design reasoning in a long conversation with no repo access,
-implementation in the editor with the repo and `CLAUDE.md` in context. Keeping those apart stopped
-the design conversation from drifting into premature implementation detail, and stopped the
-implementation agent from relitigating decisions that were already settled.
+I split the work deliberately: design reasoning in a long conversation with no repo access, implementation in a session with the repo and `CLAUDE.md` in context. Keeping those apart stopped the design conversation from drifting into premature implementation detail, and stopped the implementation agent from relitigating decisions that were already settled.
+
+**Division of labour, plainly.** The agent wrote most of the code and the first draft of every document. I set the objective, made the architectural calls, rejected several of its recommendations, and drove the review passes that found what mattered. I have read every file and can defend every decision in it.
 
 ## The configuration that mattered most
 
-`CLAUDE.md` is the piece of this setup I would keep. It encodes the design decisions as invariants
-a reviewer can check code against — for example:
+`CLAUDE.md` encodes the design decisions as invariants a reviewer — human or agent — can check code against:
 
-- the ingest goroutine never blocks, so a bare `ch <- event` on the ingest path is a bug
+- the ingest goroutine never blocks, so a bare `ch <- event` on that path is a bug
 - windows use `time_us` from the event, so `time.Now()` in windowing logic is a bug
 - every map is bounded, and if you add state you add its bound in the same change
 - never log record content; metric labels come from the fixed route set only
 
-The rule that changed agent behaviour most was not technical: *if a request conflicts with an
-invariant, say which invariant and why before writing anything.* Without it the agent silently
-picks one. With it, the disagreements surface where I can rule on them.
+The rule that changed agent behaviour most was not technical: *if a request conflicts with an invariant, say which invariant and why before writing anything.* Without it the agent silently picks one. With it, the disagreements surface where I can rule on them.
 
-I also wrote the out-of-scope list into the rules file. Left alone, agents build the broker, the
-DLQ and the sharding — all of which the design deliberately describes rather than implements.
-Naming them as out of scope was more effective than repeating "keep it small".
+I also wrote the out-of-scope list into the rules file. Left alone, agents build the broker, the DLQ and the sharding — all of which the design deliberately describes rather than implements. Naming them as out of scope worked better than repeating "keep it small".
 
-One invariant was added *because* of a bug rather than before it. The security rules originally
-said metric labels must be bounded; they now also say that anything keyed on an attacker-supplied
-value must be bounded, including log throttles. See the third item under "Where I overrode it".
+**Two invariants were written after a bug rather than before it.** `I2` now defines "the reader" as everything up to and including the enqueue, because that ambiguity is the loophole a real defect walked through. `I7` now says *wire* the eviction, not just write it. Both are in section 7 of the design.
 
 ## Prompts that did the real work
 
-### 1. Framing the problem before any code
+### 1. Sample the wire before writing the classifier
 
-> `FILL — the prompt you used to open the design conversation`
+> Before writing the classifier, connect to the live Jetstream and confirm the real payload shapes — especially what a `delete` actually carries.
 
-What came back was a survey of options. What was useful was not the recommendation but being
-forced to say why the shared-queue option fails, which became Option B in the design.
+The single most valuable instruction I gave. It produced three findings that changed the code: deletes carry no `record` at all — so referential cleanup is impossible without an index the create path writes, now a documented limitation rather than a silent bug — the measured type distribution in section 1, and real event shapes for the test fixtures. Writing the classifier from the brief's example event would have produced something that looked right and was wrong.
 
-### 2. Attacking my own design
+### 2. Attack my own design
 
-> Read the requirements and my design. Are we done? What did we miss? This is a security company
-> and there is no threat modelling at all. We never discussed error handling or idempotency. Is the
-> solution we chose the best one? What are its drawbacks?
+> Read the requirements and my design. Are we done? What did we miss? This is a security company and there is no threat modelling at all. We never discussed error handling or idempotency. Is the solution we chose the best one? What are its drawbacks?
 
-This produced the largest single improvement. It surfaced that a panic in any goroutine kills the
-whole process — which meant the isolation claim in my document was not true in code without
-`defer recover()` in every worker. It also produced the security section, and reframed the drop
-policy: in a detection context, load shedding is an evasion primitive, because an adversary who can
-generate load can hide inside the discarded window.
+The largest single improvement. It surfaced that a panic in any goroutine kills the whole process — which meant the isolation claim in my document was not true in code without `defer recover()` in every worker. It produced the security section, and reframed the drop policy: in a detection context, load shedding is an evasion primitive, because an adversary who can generate load can hide inside the discarded window.
 
-### 3. A second opinion on the draft
+### 3. A second opinion, with the agent told not to touch anything
 
-I took the design to a separate review pass rather than asking the same context to grade its own
-work. It found real inconsistencies I had missed:
+> Can you do a design review for this design? Please don't change anything there — just read it and write your thoughts here.
 
-- **Delete precedence was never stated.** The routing table implied it by row order and nothing
-  said it. "Where does a deleted post go?" is the first routing question an interviewer asks. It is
-  now stated in the design *and* enforced by the router rather than by rule ordering, so a
-  reshuffled ConfigMap cannot reintroduce the bug.
-- **D1 and D2 did not compose.** A dropped event is never enqueued, so does the cursor advance past
-  it? It must — which makes shedding irreversible, not merely counted. The document argued drops
-  were dangerous and stayed silent on the fact that they are permanent.
-- **Option C had no stated cost** while A and B each had a crisp rejection. That asymmetry is the
-  tell of a document rationalising a decision rather than making one. The cost paragraph and the
-  "isolation is between routes, not within one" admission both came from that.
-- **The skew was asserted, not measured.** Addressed by measuring it: the figures in §1 of the
-  design are from a real ten-minute run, not borrowed.
+Constraining it to *read and report* rather than *read and fix* was the point. An agent with write access quietly patches what it finds, and I would have inherited the fixes without ever seeing the findings. Four came back:
 
-### 4. Implementation, scoped tightly
+- **Delete precedence was never stated.** The routing table implied it by row order. "Where does a deleted post go?" is the first routing question anyone asks. Now stated *and* enforced by the router rather than by rule ordering, so a reshuffled ConfigMap cannot reintroduce it.
+- **D1 and D2 did not compose.** A dropped event is never enqueued, so does the cursor advance past it? It must — which makes shedding irreversible, not merely counted. The document argued drops were dangerous and stayed silent on the fact that they are permanent.
+- **Option C had no stated cost** while A and B each had a crisp rejection. That asymmetry is the tell of a document rationalising a decision rather than making one.
+- **The skew was asserted, not measured.** Fixed by measuring it — the figures in section 1 are from a real run.
 
-> `FILL — a representative implementation prompt, ideally one where you constrained the agent`
+### 4. Implementation, scoped by the contract rather than a feature list
+
+> Implement the tech stack according to this README and `CLAUDE.md`. Read the task brief again — they emphasise that the most important deliverables are `DESIGN.md` and `AI.md`.
+
+Pointing the implementation agent at files already in the repo is what kept scope under control: package layout, invariants, metric names and log messages were all settled, so there was nothing to negotiate. When it wanted to log a line per routed event, it flagged the conflict with the log-flood rule instead of just doing it — the rules file working as intended.
+
+### 5. Review the code, not the design
+
+> What do you think of this review?
+
+Late, and the most productive pass of all, because by then there was code to read rather than prose to agree with. It found an invariant violation that both the design document and the rules file explicitly forbade, plus a dead TTL sweep and a backoff counter that never reset.
+
+I did not take it on trust: I verified every claim against the code before changing anything. All were real — and one, a mismatch between the document and the code, turned out to be an error I had introduced myself earlier the same day.
 
 ## Where it helped
 
-- **Pressure-testing.** Asking "what did we miss" repeatedly, and taking the answers seriously, was
-  worth more than any generated code. Most of what it found were internal contradictions — places
-  where the document claimed something the design did not deliver.
-- **Boilerplate with a known shape.** Worker pool wiring, table-driven test scaffolding, Dockerfile
-  and manifests. Well-trodden ground where review is fast.
-- **Writing the argument down.** I knew why I rejected the shared-queue option; getting it into
-  three defensible sentences was faster with help.
-- **One test caught a bug in the code written alongside it.** A test case for a keyword containing
-  `+` failed, which exposed that `\b` cannot match next to punctuation — `\bc\+\+\b` matches
-  nothing, because the character after `+` would have to be a word character. The boundary check is
-  now a lookaround pair.
+- **Pressure-testing.** Asking "what did we miss" repeatedly, and taking the answers seriously, was worth more than any generated code. Most of what it found were internal contradictions — places where the document claimed something the design did not deliver.
+- **Boilerplate with a known shape.** Worker pool wiring, table-driven test scaffolding, Dockerfile and manifests. Well-trodden ground where review is fast.
+- **Writing the argument down.** I knew why I rejected the shared-queue option; getting it into three defensible sentences was faster with help.
+- **A test that caught the code written beside it.** A case for a keyword containing `+` failed, exposing that `\b` cannot match next to punctuation — `\bc\+\+\b` matches nothing, because the character after `+` would have to be a word character. The boundary check is now a lookaround pair.
 
 ## Where I overrode it
 
-- **The idempotency key was wrong.** It proposed `did + rkey + operation`. In AT Protocol a record
-  key is unique only within its collection, so the collection has to be part of the identity. This
-  is the kind of error that reads as correct and is not; it is now an invariant in `CLAUDE.md`.
-- **Substring keyword matching shipped and ran before anyone noticed.** With `ai` in the keyword
-  list it fired on *said*, *again*, *email* and *Dubai* — which against live data was the
-  overwhelming majority of matches. On a notification path that is worse than not matching at all.
-  Only running it against the real firehose made it obvious.
-- **It throttled a log line on the wrong key.** The default route logs unknown collections as a
-  bounded bucket, but the throttle was keyed on the raw collection — so every novel lexicon earned
-  its own log line, which is exactly the log-flood vector the throttle was meant to prevent. Found
-  by watching `kubectl logs` rather than by reading the code, and now covered by a test.
-- **Confident config that could not load.** `block_timeout: "2s"` in the ConfigMap cannot unmarshal
-  into a `time.Duration`, and the pod crash-looped on first deploy. The failure was clean because
-  config is validated at startup, which is the argument for validating it there.
-- **A test that passed for the wrong reason.** The isolation test's *healthy* route was itself
-  under-buffered, so it was shedding too; it only looked correct because the assertion was weak.
-  Tightened to fail loudly if the control route sheds.
-- **It asserted a load distribution I had not measured.** A draft included specific percentages for
-  the type skew. A borrowed number is worse than no number, so I measured it — the table in §1 is
-  from a real run against the live firehose.
-- **It over-built the design document.** After several improvement passes the write-up had grown
-  well past the requested length. Cutting it back was my call, not the agent's — it will keep
-  adding as long as you keep asking.
-
-## A fourth review pass, after the code existed
-
-I ran one more review once there was something to read, and it was the most productive of the
-four. It found an invariant violation I had written the invariant for:
-
-- **`I2` was violated by the sharding.** Selecting a per-worker queue required a key from inside
-  `commit.record`, so `Offer()` — which runs on the ingest goroutine — was doing a full
-  `json.Unmarshal` of every like and repost. The busiest route's parse, on the one goroutine whose
-  stall halts the stream, on attacker-controlled nested content, and then decoded again in the
-  handler. The document and the rules file both forbade exactly this.
-
-  The fix moved partitioning into the worker and pays a sharded mutex for it. D3 loses its
-  "no locks" property; I2 keeps the thing that actually matters. `CLAUDE.md` now spells out that
-  "the reader" includes the enqueue path, because that is the loophole the bug walked through.
-
-- **A TTL sweep that nothing called.** `Window.Sweep` existed, was documented as running on a
-  timer, and had exactly one caller: its own test. The size cap was holding the line alone, so
-  half of `I7` was decorative.
-
-- **A backoff counter that never reset.** Six brief disconnects across a week left the process
-  pinned at the maximum delay forever.
-
-- **A claim in the design that the code had outgrown** — the doc said a hot key drops events for
-  every subject on its route, but per-worker queues meant the blast radius was one shard. Fixing
-  the sharding made the doc's original claim true again, which is a coincidence I would rather
-  have arrived at deliberately.
-
-The lesson is the same one the rest of this file keeps arriving at, sharpened: an agent will
-write the invariant, cite the invariant, and then violate the invariant three files away, all in
-the same confident register. Reviews that read the code find these. Reviews that read the design
-do not.
+- **The idempotency key was wrong.** It proposed `did + rkey + operation`. In the AT Protocol a record key is unique only within its collection, so the collection has to be part of the identity. The kind of error that reads as correct and is not; now an invariant.
+- **It violated an invariant it had itself written.** Shard selection called into the handler to hash `subject.uri`, which meant a full `json.Unmarshal` of every like and repost **on the single ingest goroutine** — the busiest route's parse, on the one goroutine whose stall halts the stream, on attacker-controlled nested content, and decoded twice. `I2` forbids exactly this. The fix moved partitioning into the worker and pays a sharded mutex for it: D3 loses its "no locks" property, `I2` keeps the thing that actually matters.
+- **A TTL sweep that nothing called.** `Window.Sweep` existed, was documented as running on a timer, and had exactly one caller: its own test. Half of `I7` was decorative.
+- **Substring keyword matching shipped and ran.** With `ai` in the list it fired on *said*, *again*, *email*, *Dubai* — against live data, the overwhelming majority of matches. On a notification path that is worse than not matching at all.
+- **A log throttle keyed on the wrong thing.** The default route logs unknown collections as a bounded bucket, but the throttle was keyed on the raw, attacker-supplied collection — so every novel lexicon earned its own line, which is the exact flood the throttle existed to prevent.
+- **It left another project's CI in place.** After the rewrite, `.github/workflows/ci.yml` still installed Python and ran `pytest` against directories that no longer existed — five referenced paths, none of them present. Actions was red on three consecutive commits and I pushed past it without looking. The most embarrassing item on this list, and the one a reviewer would have seen first.
+- **It over-built the design document.** After several improvement passes the write-up had grown well past the requested length. Cutting it back was my call; it will keep adding for as long as you keep asking.
 
 ## What I would do differently
 
-`FILL — one or two honest lines. Something like: I would have written CLAUDE.md before the first
-line of code rather than after the second correction, and I would have measured the event
-distribution on day one instead of asserting it.`
+**Write `CLAUDE.md` before the first line of code, not after the second correction.** Most of its invariants were extracted from mistakes rather than anticipated. The ones written up front are also the ones that held.
+
+**Run it earlier.** Three of the six defects in section 7 of the design needed the service running to surface, and one needed a clean-cluster deploy following my own README. I wrote a great deal of prose about behaviour under congestion before ever watching it behave.
+
+**Read the CI output.** Three red builds is not a subtle signal.
 
 ## An honest summary
 
-The agent was most valuable as an adversary and least valuable as an author. Every structural
-decision in `DESIGN.md` is one I can defend and would defend differently under different
-constraints; the sharpest additions came from asking it to attack the design rather than to produce
-one.
+The agent was most valuable as an adversary and least valuable as an author. Every structural decision in `DESIGN.md` is one I can defend and would defend differently under different constraints; the sharpest additions came from asking it to attack the design rather than produce one.
 
-The pattern in the override list is worth stating plainly: almost every real defect was found by
-*running* the thing — against the live firehose, or in the cluster — and not by reading the code.
-The agent's output is uniformly confident whether or not it has been verified, so the review that
-matters is the one that executes it. Anything I could not explain did not ship.
+The pattern in the override list is the thing worth taking away: **the agent will write an invariant, cite that invariant, and then violate it three files away — all in the same confident register.** Its output reads identically whether or not it has been verified. So the review that counts is the one that executes the code, or reads it against the document — not the one that reads the document alone.
+
+That is also why section 7 of the design exists, and why it is written the way it is: a design document is a claim to be checked, not a record of what is true.
