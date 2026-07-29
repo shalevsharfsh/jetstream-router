@@ -1,8 +1,3 @@
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-cdk.out/
-infra/cdk/cdk.out/
-node_modules/
+bin/
+*.out
+.DS_Store

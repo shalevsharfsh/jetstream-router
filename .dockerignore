@@ -1,12 +1,5 @@
-.venv/
-.git/
-.github/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-infra/cdk/cdk.out/
-tests/
-docs/
-k8s/
+.git
+.github
+bin
+deploy/*.yaml
 *.md

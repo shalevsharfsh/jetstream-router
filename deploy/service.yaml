@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jetstream-router
+  labels:
+    app: jetstream-router
+spec:
+  selector:
+    app: jetstream-router
+  ports:
+    - name: admin
+      port: 8080
+      targetPort: 8080

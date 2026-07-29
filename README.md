@@ -1,147 +1,167 @@
-# jetstream-router
+# Jetstream Event Router
 
-One ingest, many event types, fanned out to workers that run, fail and scale
-independently.
+A Go service that consumes the Bluesky Jetstream firehose over a single WebSocket, classifies
+every event, and fans it out to per-type workers that run, fail and scale independently of one
+another.
 
-Consumes the [Bluesky Jetstream](https://docs.bsky.app/blog/jetstream) firehose
-over a single WebSocket, classifies every event, and routes it to a
-type-specific worker. Each worker is its own Deployment with its own durable
-consumer, its own retry budget, its own dead-letter queue and its own scaling
-policy — so a failure or a backlog on one path cannot touch another.
+The reasoning behind the design — the options weighed, the decisions and their costs — is in
+[`DESIGN.md`](./DESIGN.md). That is the document to read first. This file is how to run it.
 
-Read [DESIGN.md](DESIGN.md) for the reasoning, the trade-offs, and what I chose
-not to build. [AI.md](AI.md) covers the agent setup and the prompts behind the
-real decisions.
+## Requirements
 
-> **Stack note, up front.** The brief specified Go + Kubernetes. This is Python
-> + Kubernetes, with the serverless equivalent as real, synthesising CDK in
-> `infra/cdk/`. That is a deliberate deviation and DESIGN.md argues it in full
-> rather than in passing — including what it costs.
+- Go 1.22+
+- Docker
+- [kind](https://kind.sigs.k8s.io/) and `kubectl`
 
----
-
-## The shape
-
-```
-              wss://jetstream2.us-east.bsky.network/subscribe
-                    ?wantedCollections=…&cursor=<time_us>
-                                  │
-                        ┌─────────▼──────────┐
-                        │   TAP  (1 replica) │   the only stateful component
-                        │  classify · bound  │   asyncio · orjson
-                        │  backpressure      │   cursor → Redis
-                        └─────────┬──────────┘
-                                  │  publish bsky.<destination>
-                        ┌─────────▼──────────┐
-                        │  NATS JetStream    │  one durable consumer per path
-                        └┬────┬────┬────┬───┬┘
-        ┌────────────────┘    │    │    │   └──────────────┐
-        ▼                     ▼    ▼    ▼                  ▼
-   content              engagement  graph  retraction    other
-   post/create          like+repost follow  op=delete    identity/account
-   keyword match        rolling     burst   cleanup      + unknown types
-   → notification       counts      detect  path         (counted only)
-        │                     │      │        │              │
-     min 1              KEDA 1..6  KEDA 1..4  min 1        min 1
-                                  │
-                          Redis (windows, cursor, claims)
-```
+Nothing else. The service needs no credentials: Jetstream is a public, unauthenticated endpoint.
 
 ## Run it
 
-Requires Docker, `kind`, `kubectl`. Nothing else — no AWS account, no registry.
-
 ```bash
-make deploy      # kind cluster + KEDA + build + load + apply. ~3-4 minutes.
-make demo        # tail the alerts every path is producing
+# 1. Create a local cluster
+kind create cluster --name jetstream-router
+
+# 2. Build the image and load it into the cluster
+docker build -f deploy/Dockerfile -t jetstream-router:dev .
+kind load docker-image jetstream-router:dev --name jetstream-router
+
+# 3. Deploy
+kubectl apply -f deploy/
+
+# 4. Watch it work
+kubectl logs -f deploy/jetstream-router
 ```
 
-`make deploy` is idempotent; re-run it after changing code.
+`make deploy` does steps 1–3 in one command.
 
-### See it working
+Within a few seconds of the pod becoming ready you should see the connection come up and events
+start flowing. The firehose is busy — likes dominate — so the engagement route carries roughly
+three quarters of all traffic immediately.
 
-```bash
-make demo          # ALERT lines from all four paths, live
-make logs          # everything, not just alerts
-make metrics       # tap counters: received, classified, published, shed, lag
-make scale-watch   # watch KEDA move replicas per path, independently
-make chaos         # kill the engagement worker; the other paths carry on
-make test          # 50 tests, no infrastructure needed
-make down          # delete the namespace, keep the cluster
-make clean         # delete the cluster
+## What you should see
+
+Structured JSON logs, one line per notable event. Nothing user-generated is ever logged; only
+structural and derived fields (see the security section of `DESIGN.md`).
+
+```
+{"level":"INFO","msg":"starting","routes":["retraction","content","engagement","social-graph","default"]}
+{"level":"INFO","msg":"connection state","state":"live"}
+{"level":"INFO","msg":"keyword matched","route":"content","did":"did:plc:…","matched":["security"],"text_len":300}
+{"level":"WARN","msg":"threshold crossed","route":"engagement","subject":"at://…","count":100}
+{"level":"INFO","msg":"burst detected","route":"social-graph","target":"did:plc:…","window_s":300,"count":25}
+{"level":"INFO","msg":"unknown collection","route":"default","bucket":"other"}
+{"level":"WARN","msg":"buffer full, event dropped","route":"engagement","dropped_total":1284}
 ```
 
-Within a minute or so of `make demo` you should see `keyword-match` from the
-content path and `unusual-traction` from engagement. `follow-burst` is rarer by
-nature — lower `FOLLOW_THRESHOLD` in `k8s/20-config.yaml` to force it.
+The last two lines are the interesting ones. `unknown collection` is a new lexicon appearing on the
+network and being observed rather than swallowed — about 4% of the unfiltered stream. `buffer full,
+event dropped` is the isolation mechanism working as designed: one route shedding while the others
+keep draining.
 
-### The one thing worth watching
+Per-event routing decisions are logged at `DEBUG`, not `INFO`. At firehose rates that is several
+hundred lines a second, which is a denial-of-service on your own log pipeline; the per-route
+counters carry the same information at a rate a human can read. Set `LOG_LEVEL=debug` to see them.
+
+### Seeing the routes behave differently
 
 ```bash
-make chaos
+kubectl port-forward deploy/jetstream-router 8080:8080
+curl -s localhost:8080/metrics | grep -E 'events_(routed|dropped)_total'
 ```
 
-Deletes the engagement worker — the busiest path, ~79% of all traffic — and
-shows the other three continuing without a blip, then engagement draining its
-backlog on restart. That single command is the property the whole design exists
-to provide. Measured on this cluster: with engagement down for ~30s, content
-still processed 1,067 events and retraction 258, and engagement's consumer
-returned to zero pending after restart.
+Watching `events_dropped_total{route=…}` climb on one route while the others keep processing is the
+clearest demonstration that the fan-out is real. `make congest` shrinks the engagement buffer to 1
+so you can watch exactly that happen against live traffic.
+
+`/healthz` and `/readyz` are on the same port. They differ deliberately: losing the upstream makes
+the service un-ready but not dead, and readiness also fails when cursor lag exceeds `max_lag`.
 
 ## Configuration
 
-Everything tunable lives in `k8s/20-config.yaml` (a ConfigMap). The interesting
-ones:
+Everything tunable lives in a ConfigMap (`deploy/configmap.yaml`) so that adding an event type is a
+configuration change rather than a code change.
 
-| Setting | Default | Why you'd change it |
-|---|---|---|
-| `TAP_BACKPRESSURE_POLICY` | `shed` | `shed` drops the oldest queued events under overload and stays current; `block` stops reading the socket and loses nothing but falls behind. The most consequential setting in the service — see DESIGN.md §6. |
-| `TAP_QUEUE_MAXSIZE` | `10000` | How much latency is absorbed before that policy engages. |
-| `ROUTER_COLLECTION_ROUTES` | 4 collections | The routing table. Adding a collection to an existing path is a config change; adding a new *path* is not. |
-| `CONTENT_KEYWORDS` | common words | Deliberately common so the demo is not silent. |
-| `ENGAGEMENT_THRESHOLD` | `25` / 60s | Likes+reposts on one post before "unusual traction". |
-| `FOLLOW_THRESHOLD` | `10` / 60s | Follows of one account before "burst". Lower it to see the path fire. |
+| Key | Default | What it does |
+| --- | --- | --- |
+| `routing.rules[].match` | see below | Routing key: `kind`, `collection` (glob), `operation` |
+| `routing.fallback` | `default` | Where unmatched events go. Required |
+| `routes[].workers` | varies | Size of that route's worker pool |
+| `routes[].buffer` | varies | Bounded channel capacity |
+| `routes[].policy` | `drop` | `drop` sheds and counts; `block` applies backpressure |
+| `routes[].block_timeout` | `2s` | Caps how long `block` may stall the reader |
+| `jetstream.wantedCollections` | *(empty)* | Server-side filter. Off deliberately — see `DESIGN.md`. `["derive"]` takes it from the routing table |
+| `keywords`, `languages` | — | Content route match list |
+| `thresholds.engagement` | 100 / 5m | Rolling count that raises an alert |
+| `thresholds.followBurst` | 25 / 5m | Follows to one target inside the window |
+| `state.max_keys_per_shard` | 20000 | Bound on every aggregation map |
+| `state.dedup_window` | `2m` | How long a replayed event is remembered |
 
-## The serverless target
-
-`infra/cdk/` is the same topology as AWS managed services: Fargate tap →
-EventBridge → SQS (+DLQ) → Lambda per path → DynamoDB. It **synthesises** and is
-checked in CI:
-
-```bash
-cd infra/cdk && npx aws-cdk@2 synth
-```
-
-**It has not been deployed to a live account.** It exists so the claim that this
-design is serverless-shaped is checkable rather than rhetorical. The same
-handlers run on both targets — `WorkerContext` is handed a store interface, with
-`RedisWindowStore` on Kubernetes and `DynamoWindowStore` on Lambda.
+Routing precedence is operation-first: `operation == delete` matches before the collection map,
+because a delete commit carries no record for a create-path handler to match against. That ordering
+is a property of the router, not of the order rules appear in the ConfigMap.
 
 ## Layout
 
 ```
-router/routing.py       the classifier — pure, no I/O, the piece to read first
-router/tap.py           WebSocket ingest, backpressure, cursor
-router/workers/runner.py  consumer loop: ack, retry, DLQ, graceful drain
-router/workers/*.py     one module per path
-router/windows.py       bucketed sliding-window counters + the store interface
-router/aws_handlers.py  Lambda entrypoints (SQS batch → same handlers)
-k8s/                    namespace, NATS, Redis, config, tap, workers, KEDA
-infra/cdk/              the AWS target
-tests/                  routing, workers, and a fake Jetstream server
+cmd/router/           main: config, wiring, signal handling
+internal/jetstream/   WebSocket client, reconnect state machine, cursor
+internal/event/       envelope types, lazy record decoding
+internal/routing/     classifier + router (pure functions)
+internal/route/       bounded channel + worker pool + panic recovery
+internal/handler/     one file per route, plus the bounded state primitives
+internal/obs/         metrics, structured logging, health endpoints
+internal/config/      config struct, loaded from the ConfigMap
+deploy/               Dockerfile, manifests
 ```
+
+## Tests
+
+```bash
+go test ./...
+go test -race ./...
+```
+
+Six tests carry the design rather than chasing coverage: the router table (including delete
+precedence, an `identity` event with no commit block, and an unknown collection), isolation under
+congestion, panic containment, window logic on event time, cursor and idempotency across a
+simulated reconnect, and an integration test against a fake WebSocket server so the suite does not
+depend on the live network.
 
 ## Assumptions
 
-- **The tap is a singleton.** `replicas: 1` is a correctness constraint, not a
-  capacity choice — two taps would double-publish everything. Scaling out means
-  partitioning by DID; described in DESIGN.md §9, not built.
-- **At-least-once, not exactly-once.** The cursor rewinds a few seconds on
-  resume, deliberately reprocessing rather than risking a gap.
-- **NATS and Redis here are single-pod and ephemeral.** They make the topology
-  runnable on a laptop; they are not a production recommendation, and the
-  manifests say so.
-- **Post text is matched, never emitted.** Alerts carry the DID, the record key
-  and which keyword hit — not the content. This is a public, unfiltered
-  firehose.
-- **The AWS stack is synthesised, not deployed.**
+- **No server-side filtering.** `wantedCollections` is supported but off by default. Filtering at
+  the source would discard the type mix this service exists to route.
+- **The cursor is a local file** on an `emptyDir`. Adequate for a single-pod prototype; production
+  would commit it to Redis or DynamoDB on broker acknowledgement. A pod restart therefore resumes
+  from live, and a reconnect replays a bounded overlap, which the handlers tolerate because they
+  are idempotent.
+- **Aggregation state is in memory,** bounded by size and TTL. It does not survive a restart —
+  counters reset, so a threshold that was about to fire will not.
+- **One replica.** The connection is a singleton; two readers over the same range would process
+  everything twice. The Deployment uses `Recreate` rather than the default rolling update for this
+  reason.
+- **Alerts are structured log lines.** No webhook, no notification service. The `Sink` interface is
+  where a real one would attach.
+
+## Scope
+
+Implemented: the full pipeline — connection with reconnect and resume, classification, routing,
+bounded per-route queues with drop accounting, worker pools with panic recovery, and the five
+routes described in `DESIGN.md`.
+
+Deliberately described rather than built, and marked as such in the design: the broker swap,
+external state, per-route dead-letter queues that outlive the process, sharded multi-connection
+ingest, and replay tooling. The dispatch interface is the seam each of those attaches to.
+
+## Teardown
+
+```bash
+kind delete cluster --name jetstream-router
+```
+
+## A note on the source
+
+This reads the unfiltered public firehose of a live social network. Record text can contain
+anything, and it is treated as attacker-controlled throughout: it is never written to a log line,
+never persisted, and parsed only inside the worker that owns it. The service processes event
+structure and metadata, not content.

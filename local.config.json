@@ -1,0 +1,10 @@
+{
+  "jetstream": { "cursor_path": "./bin/cursor.json" },
+  "handlers": {
+    "keywords": ["kubernetes", "security", "agent", "bluesky"],
+    "languages": ["en"],
+    "engagement_threshold": 15,
+    "follow_threshold": 5,
+    "window_seconds": 60
+  }
+}

@@ -1,0 +1,63 @@
+# The routing table is configuration, not code.
+#
+# Adding an event type to an existing route is an edit here plus a restart.
+# Adding a genuinely new route is not, and should not be: a new route implies a
+# buffer, a pool, a drop policy and its own metrics.
+#
+# Routing precedence is operation-first (I3): the delete rule below is evaluated
+# before any collection rule regardless of where it appears in this list, because
+# a delete commit carries no record for a create-path handler to match against.
+#
+# The per-route numbers are deliberately NOT uniform. Measured against the live
+# firehose the routes differ in volume by more than an order of magnitude, and
+# they differ in what a lost event costs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jetstream-router
+  labels:
+    app: jetstream-router
+data:
+  config.json: |
+    {
+      "jetstream": {
+        "url": "wss://jetstream2.us-east.bsky.network/subscribe",
+        "wantedCollections": [],
+        "cursor_path": "/var/lib/jetstream-router/cursor.json",
+        "replay_rewind": "5s",
+        "replay_window": "10m",
+        "live_threshold": "3s",
+        "max_lag": "60s",
+        "max_frame_bytes": 1048576,
+        "backoff_max": "30s",
+        "commit_every": "1s"
+      },
+      "admin": { "addr": ":8080" },
+      "routing": {
+        "rules": [
+          { "match": { "kind": "commit", "operation": "delete" },                      "route": "retraction" },
+          { "match": { "kind": "commit", "collection": "app.bsky.feed.post" },         "route": "content" },
+          { "match": { "kind": "commit", "collection": "app.bsky.feed.like" },         "route": "engagement" },
+          { "match": { "kind": "commit", "collection": "app.bsky.feed.repost" },       "route": "engagement" },
+          { "match": { "kind": "commit", "collection": "app.bsky.graph.follow" },      "route": "social-graph" }
+        ],
+        "fallback": "default"
+      },
+      "routes": {
+        "content":      { "buffer": 4096,  "workers": 4, "policy": "drop" },
+        "engagement":   { "buffer": 32768, "workers": 8, "policy": "drop" },
+        "social-graph": { "buffer": 4096,  "workers": 2, "policy": "drop" },
+        "retraction":   { "buffer": 4096,  "workers": 2, "policy": "block", "block_timeout": "2s" },
+        "default":      { "buffer": 1024,  "workers": 1, "policy": "drop" }
+      },
+      "keywords":  ["kubernetes", "security", "agent", "bluesky"],
+      "languages": ["en"],
+      "thresholds": {
+        "engagement": 100,
+        "engagement_window": "5m",
+        "followBurst": 25,
+        "followBurst_window": "5m"
+      },
+      "state": { "max_keys_per_shard": 20000, "dedup_window": "2m" },
+      "shutdown_timeout": "25s"
+    }

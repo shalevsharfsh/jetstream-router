@@ -1,0 +1,35 @@
+# The service takes no inbound traffic except metric scraping, and its only
+# outbound dependencies are DNS and the Jetstream endpoint. Saying so explicitly
+# means a compromised dependency cannot quietly reach anything else.
+#
+# It needs no credentials of any kind, and that property is worth keeping.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jetstream-router
+spec:
+  podSelector:
+    matchLabels:
+      app: jetstream-router
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Outbound TLS to the firehose. Narrowing this to the endpoint's addresses
+    # needs a CIDR or an egress gateway; the shape is here and the tightening is
+    # a one-line change.
+    - ports:
+        - protocol: TCP
+          port: 443

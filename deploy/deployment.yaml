@@ -1,0 +1,96 @@
+# replicas: 1 is a CORRECTNESS constraint, not a capacity choice.
+#
+# Jetstream is one socket with no consumer group. Two readers over the same range
+# process everything twice, and every aggregate in the system silently doubles.
+# Scaling the front means sharding — N connections partitioned by
+# wantedCollections or wantedDids, each a strict singleton — not replicas.
+#
+# strategy: Recreate for the same reason: the default rolling update briefly runs
+# two pods, and "tolerable because the handlers are idempotent" is a weaker
+# guarantee than "never happens".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jetstream-router
+  labels:
+    app: jetstream-router
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jetstream-router
+  template:
+    metadata:
+      labels:
+        app: jetstream-router
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      # Long enough for the ordered drain: stop reading, drain the routes, commit
+      # the cursor last. Shorter and the kubelet SIGKILLs us mid-drain, so we
+      # replay more than necessary on restart.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: router
+          image: jetstream-router:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/router/config.json"]
+          ports:
+            - name: admin
+              containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/router
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/jetstream-router
+          # Liveness deliberately does NOT fail while disconnected. Restarting the
+          # pod at the moment the reconnect backoff is working correctly would
+          # throw away the backoff it has earned. Readiness does fail — both on
+          # disconnect and when cursor lag exceeds max_lag. A process holding a
+          # healthy socket while two minutes behind is not working, and a probe
+          # that only checked the socket would report it as fine.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: jetstream-router
+        # The cursor is the only thing written at runtime. emptyDir means a pod
+        # restart resumes from live rather than from the last checkpoint — the
+        # prototype's accepted limitation, and a PVC is the one-line fix.
+        - name: state
+          emptyDir: {}

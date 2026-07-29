@@ -1,7 +1,0 @@
-# Runtime dependencies. Pinned to minor to keep the image reproducible.
-websockets>=15.0,<16
-nats-py>=2.9,<3
-redis>=6.0,<7
-orjson>=3.10,<4
-prometheus-client>=0.21,<1
-aiohttp>=3.11,<4
