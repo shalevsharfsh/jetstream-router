@@ -96,6 +96,27 @@ I did not take it on trust: I verified every claim against the code before chang
 
 **Read the CI output.** Three red builds is not a subtle signal.
 
+**Open with a stricter prompt.** Working backwards from the commits that should not have existed,
+the instruction I actually gave was missing four things, and each one maps to a specific defect:
+
+- *"If you think the specified approach is wrong, say so before writing any code, and wait."*
+  Settling the stack in conversation while building something else was the single largest source
+  of rework.
+- *"Everything you create must have a caller; everything you reference must exist — check."*
+  `Window.Sweep` had no caller; the CI workflow referenced five paths, none of which existed.
+- *"Name the file and line that satisfies each invariant in `CLAUDE.md`."* This is the one I would
+  keep above all others. Stating a rule does not enforce it, and a plainly written invariant did
+  not stop the code from breaking it. Forcing the agent to cite its own compliance turns prose
+  into a check.
+- *"Then do one pass whose only job is to break it, and report what you did not finish."* Asked to
+  build and verify in the same breath, an agent verifies optimistically. The adversarial pass has
+  to be a separate named step with its own output.
+
+The broader lesson is that the prompt was not the bottleneck — the missing contract was. Once
+`README.md` and `CLAUDE.md` existed, the implementation instruction could be one line and still
+land, because every decision the agent would otherwise invent had already been made. A thin prompt
+over a thick contract beats a thick prompt over nothing.
+
 ## An honest summary
 
 The agent was most valuable as an adversary and least valuable as an author. Every structural decision in `DESIGN.md` is one I can defend and would defend differently under different constraints; the sharpest additions came from asking it to attack the design rather than produce one.
