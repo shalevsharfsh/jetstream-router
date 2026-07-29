@@ -169,6 +169,17 @@ func New(cfg Config, h Handler, log *slog.Logger) *Route {
 		queue:   make(chan event.Event, cfg.Buffer),
 	}
 	obs.QueueCapacity.WithLabelValues(cfg.Name).Set(float64(cfg.Buffer))
+
+	// Materialise the per-route counters at zero so they exist before anything
+	// happens to them. A Prometheus labelled counter is absent until first
+	// incremented, which makes "no drops" and "no such route" look identical on
+	// a dashboard and in the README's own grep — and absent is the reading you
+	// least want to get wrong about a drop counter.
+	obs.EventsRouted.WithLabelValues(cfg.Name).Add(0)
+	obs.EventsDropped.WithLabelValues(cfg.Name).Add(0)
+	obs.HandlerPanics.WithLabelValues(cfg.Name).Add(0)
+	obs.QueueDepth.WithLabelValues(cfg.Name).Set(0)
+
 	return r
 }
 
